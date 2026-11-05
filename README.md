@@ -10,6 +10,8 @@ src/pr-reports/report_config.py     source filters (wildcards) and config valida
 src/pr-reports/sources.schema.json  JSON Schema for the config file
 src/pr-reports/sources.example.json example config (copy to sources.json, which is git-ignored)
 src/pr-reports/test_report_config.py unit tests (python -m unittest, run from src/pr-reports)
+src/backlog-reports/ado_story_report.py   Azure DevOps: time in state and AI usage for done user stories
+src/backlog-reports/test_ado_story_report.py unit tests (python -m unittest, run from src/backlog-reports)
 ```
 
 ### `ai_pr_report.py`
@@ -77,3 +79,21 @@ A config file selects GitHub orgs, GitLab groups and repositories, and combines 
 #### Privacy
 
 The report and cache contain PR titles, descriptions, commit messages and author emails from your organisation. They are git-ignored here; do not publish them if the repositories are private.
+
+### `ado_story_report.py` (Azure DevOps backlog)
+
+Looks at the user stories (or another work item type) that reached `Done` and reports how long they sat in each state and whether they were solved with AI:
+
+- time per state (New, Approved, Refined, Committed, Testable, ...) with median, mean and P90
+- three phases: **created** (time in Proposed-category states), **committed** (InProgress-category states) and **lead time** (creation until done)
+- the same figures split into AI-assisted, not AI and no PR data, plus a per-month table and a filterable story list
+
+A story counts as AI-assisted when one of its linked pull / merge requests is AI-assisted in the JSON written by `ai_pr_report.py --json`, so run that first. Stories without a linked PR found in that data are shown as "no PR data" rather than "not AI". GitHub PR links created by Azure Boards (which only contain a repository id and a PR number) are matched by PR number plus creation time; GitLab merge request links and plain URLs match directly. Azure Repos pull requests are not matched.
+
+```sh
+python src/backlog-reports/ado_story_report.py                          # org/project from `az devops configure`
+python src/backlog-reports/ado_story_report.py --org my-org --project MyProject --since 2026-01-01
+python src/backlog-reports/ado_story_report.py --prs src/pr-reports/ai-prs.json --out ai-stories.html --json ai-stories.json
+```
+
+Authentication uses your Azure CLI login (`az login`). A login can span several Entra tenants and only one backs the organization, so the tool tries each tenant until Azure DevOps accepts one (`--tenant` pins it). Alternatively set a personal access token in `ADO_PAT`. State histories are cached in `.cache/`. The report contains story titles and is git-ignored.
