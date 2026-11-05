@@ -28,7 +28,7 @@ Detected tools: Claude (Claude Code), GitHub Copilot and Cursor. Detection is ba
 
 - Python 3.10+, no third-party packages
 - For GitHub: the [GitHub CLI](https://cli.github.com/) (`gh`), authenticated with access to the organisation (`gh auth login`)
-- For GitLab: the [GitLab CLI](https://gitlab.com/gitlab-org/cli) (`glab`), authenticated via `glab auth login` or a `GITLAB_TOKEN`. A classic token needs `read_api`. A fine-grained token needs read access to merge requests and repository commits
+- For GitLab: the [GitLab CLI](https://gitlab.com/gitlab-org/cli) (`glab`), authenticated via `glab auth login` or a `GITLAB_TOKEN`. Use a classic personal (or group) access token with the `read_api` scope and at least the Reporter role: it enables the fast GraphQL path. Fine-grained tokens are not accepted by GitLab's GraphQL API, so the tool falls back to the much slower REST path (one call per merge request and commit)
 - Optional: the `claude` CLI on the PATH, for purpose classification (`--classify none` skips it)
 
 #### Usage
@@ -44,7 +44,7 @@ python src/pr-reports/ai_pr_report.py --org my-org --repos RepoA 'api-*'
 python src/pr-reports/ai_pr_report.py --org my-org --out report.html --json prs.json
 ```
 
-On GitLab, merge requests are treated as PRs. Run `--help` for all options. Fetched data is cached per repository in `.cache/` (12 hours by default).
+On GitLab, merge requests are treated as PRs. With GraphQL, a project's merge requests, commits and total added lines come back in a few calls, and per-commit line counts are only fetched for AI commits of partly-AI merge requests. The GitLab code share therefore uses each merge request's net diff, which is slightly lower than the sum over commits used on GitHub and in the REST fallback. Run `--help` for all options. Fetched data is cached per repository in `.cache/` (12 hours by default).
 
 #### Choosing what is scanned (config file)
 

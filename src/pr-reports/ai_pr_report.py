@@ -192,9 +192,33 @@ def classify(node: dict, repo: str, source: str = "github") -> PR:
         share = (pr.lines_added_ai / pr.lines_added) if pr.lines_added else (1.0 if agent_pr else 0.0)
         pr.lines_added, pr.lines_added_ai = total, round(total * share)
 
+    if node.get("diffAdditions") is not None:
+        # GitLab GraphQL: total lines come from the MR's diff summary; per-commit counts were only
+        # fetched for AI commits of partly-AI MRs (see _fill_ai_stats).
+        total = node["diffAdditions"]
+        pr.lines_added = total
+        pr.lines_added_ai = total if agent_pr else min(pr.lines_added_ai, total)
+
     pr.tools = sorted(tools)
     pr.signals = list(dict.fromkeys(signals))
     return pr
+
+
+def ai_commit_indices(node: dict) -> tuple[bool, list[int]]:
+    """(whole PR is by an agent, indexes of commits carrying an AI marker). Mirrors classify()."""
+    author = (node.get("author") or {}).get("login") or "ghost"
+    branch = node.get("headRefName") or ""
+    if any(_match(r["author"], author) or _match(r["branch"], branch) for r in COMPILED.values()):
+        return True, []
+    idx = []
+    for i, nd in enumerate((node.get("commits") or {}).get("nodes", [])):
+        c = nd["commit"]
+        a = c.get("author") or {}
+        who = f'{a.get("name") or ""} <{a.get("email") or ""}>'
+        if any(_match(r["text"], c.get("message") or "") or _match(r["text"] + r["author"], who)
+               for r in COMPILED.values()):
+            idx.append(i)
+    return False, idx
 
 
 # --------------------------------------------------------------------------- #
@@ -334,6 +358,7 @@ def fetch_pr_nodes(org: str, repo: str, since: dt.datetime | None) -> list[dict]
 
 WEB_BASE = {"github": "https://github.com", "gitlab": "https://gitlab.com"}
 _gl_projects: dict[str, dict[int, dict]] = {}  # full project path -> {MR id: MR}
+_gl_since: dt.datetime | None = None
 
 
 def glab(args: list[str], retries: int = 6) -> str:
@@ -374,6 +399,8 @@ def load_gitlab_group(group: str, since: dt.datetime | None, include_archived: b
              f"&order_by=created_at&sort=desc&non_archived={'false' if include_archived else 'true'}")
     if since:
         query += f"&created_after={since:%Y-%m-%dT%H:%M:%SZ}"
+    global _gl_since
+    _gl_since = since
     paths: dict[str, None] = {}
     for mr in _json_values(glab(["api", "--paginate", query])):
         full = mr["references"]["full"].rsplit("!", 1)[0]
@@ -418,8 +445,79 @@ def _gitlab_node(mr: dict) -> dict:
     }
 
 
+GL_MR_QUERY = """query { project(fullPath: "%s") { mergeRequests(state: all, sort: CREATED_DESC, first: 50%s%s) {
+  pageInfo { hasNextPage endCursor }
+  nodes { iid title description webUrl state createdAt mergedAt closedAt updatedAt sourceBranch
+    author { username } diffStatsSummary { additions } commitCount
+    commitsWithoutMergeCommits(first: 40) { nodes { sha authorName authorEmail message } } } } } }"""
+
+
+def _gitlab_graphql_node(m: dict) -> dict:
+    state = {"opened": "OPEN", "merged": "MERGED"}.get(m["state"], "CLOSED")
+    merged_at = (m.get("mergedAt") or m.get("closedAt") or m.get("updatedAt")) if state == "MERGED" else None
+    commits = [{"commit": {
+        "sha": c["sha"], "message": c.get("message") or "", "additions": None,
+        "parents": {"totalCount": 1},  # merge commits are already excluded by the query
+        "author": {"name": c.get("authorName"), "email": c.get("authorEmail")},
+    }} for c in m["commitsWithoutMergeCommits"]["nodes"]]
+    return {
+        "number": int(m["iid"]), "title": m.get("title"), "url": m["webUrl"], "state": state,
+        "createdAt": m["createdAt"], "mergedAt": merged_at, "headRefName": m.get("sourceBranch"),
+        "body": m.get("description"), "author": {"login": (m.get("author") or {}).get("username")},
+        "diffAdditions": (m.get("diffStatsSummary") or {}).get("additions"),
+        "commits": {"totalCount": m.get("commitCount") or len(commits), "nodes": commits},
+    }
+
+
+def _gitlab_graphql_nodes(project_path: str, since: dt.datetime | None) -> list[dict]:
+    if not re.fullmatch(r"[\w./-]+", project_path):
+        raise RuntimeError(f"unsupported project path {project_path!r}")
+    created = f', createdAfter: "{since:%Y-%m-%dT%H:%M:%SZ}"' if since else ""
+    nodes: list[dict] = []
+    after = None
+    while True:
+        cursor = f', after: "{after}"' if after else ""
+        out = json.loads(glab(["api", "graphql", "-f", "query=" + GL_MR_QUERY % (project_path, created, cursor)]))
+        project = (out.get("data") or {}).get("project")
+        if out.get("errors") or project is None:
+            raise RuntimeError("GitLab GraphQL unavailable (" + str(out.get("errors") or "project not visible to token")[:150] + ")")
+        conn = project["mergeRequests"]
+        nodes += [_gitlab_graphql_node(m) for m in conn["nodes"]]
+        if not conn["pageInfo"]["hasNextPage"]:
+            return nodes
+        after = conn["pageInfo"]["endCursor"]
+
+
+def _fill_ai_stats(project_path: str, nodes: list[dict]) -> None:
+    """Per-commit line counts, only for AI commits of MRs that are not wholly agent-made."""
+    jobs = []
+    for n in nodes:
+        agent, idx = ai_commit_indices(n)
+        if not agent:
+            jobs += [n["commits"]["nodes"][i]["commit"] for i in idx]
+
+    def work(c: dict) -> None:
+        try:
+            info = json.loads(glab(["api", f"projects/{quote(project_path, safe='')}/repository/commits/{c['sha']}"]))
+            c["additions"] = (info.get("stats") or {}).get("additions") or 0
+        except Exception:
+            c["additions"] = 0  # commit no longer reachable
+
+    with cf.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(work, jobs))
+
+
 def fetch_gitlab_nodes(project_path: str) -> list[dict]:
-    return [_gitlab_node(mr) for mr in _gl_projects.get(project_path, {}).values()]
+    """Fast path: GraphQL (a few calls per project). Fallback: REST, one call per MR and commit."""
+    try:
+        nodes = _gitlab_graphql_nodes(project_path, _gl_since)
+    except RuntimeError as e:
+        print(f"  {project_path}: {e}; using the slower REST API", file=sys.stderr)
+        mrs = list(_gl_projects.get(project_path, {}).values())
+        with cf.ThreadPoolExecutor(max_workers=6) as pool:
+            return list(pool.map(_gitlab_node, mrs))
+    _fill_ai_stats(project_path, nodes)
+    return nodes
 
 
 # --------------------------------------------------------------------------- #
