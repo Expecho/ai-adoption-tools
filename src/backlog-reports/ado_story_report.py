@@ -273,6 +273,10 @@ def build_story(wi: dict, events: list[tuple[dt.datetime, str]], org_url: str, c
         if phase:
             phases[phase] += d
     tags = [t.strip() for t in (f.get("System.Tags") or "").split(";") if t.strip()]
+    own_links: dict[str, dict] = {}   # the story's own links first, then its descendants'; the first holder wins
+    for holder in [wi, *(descendants or [])]:
+        for link in pr_links(holder.get("relations") or [], holder["id"]):
+            own_links.setdefault(link["url"], link)
     return Story(
         id=wi["id"], title=f.get("System.Title") or "", url=f"{org_url}/_workitems/edit/{wi['id']}",
         created=created.isoformat(), done=done_at.isoformat(), tags=tags,
@@ -280,9 +284,7 @@ def build_story(wi: dict, events: list[tuple[dt.datetime, str]], org_url: str, c
         phase_days={"created": round(phases.get("created", 0.0), 2), "committed": round(phases.get("committed", 0.0), 2)},
         lead_days=round(days(created, done_at), 2),
         reopened=sum(1 for _, st in events if st == "Done") > 1,
-        pr_links=list({l["url"]: l for l in
-                       pr_links(wi.get("relations") or [], wi["id"])
-                       + [l for d in descendants or [] for l in pr_links(d.get("relations") or [], d["id"])]}.values()),
+        pr_links=list(own_links.values()),
     )
 
 
