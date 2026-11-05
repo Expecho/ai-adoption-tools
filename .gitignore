@@ -1,0 +1,7 @@
+# Generated output and cached org data (contains private PR/commit data and emails)
+.cache/
+ai-prs.html
+ai-prs.json
+run.log
+*.log
+__pycache__/
