@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI-assisted PR report for a GitHub organization.
+AI-assisted PR report for a GitHub organization or GitLab group.
 
 Scans every repository in an org, classifies each pull request (and each of its
 commits) as AI-assisted or not, and writes a self-contained HTML report with:
@@ -11,11 +11,14 @@ commits) as AI-assisted or not, and writes a self-contained HTML report with:
 
 Detected tools: Claude (Claude Code), Cursor, GitHub Copilot.
 
-Requires the GitHub CLI (`gh`) to be installed and authenticated
-(`gh auth login`) with access to the org. No other dependencies.
+GitHub (default) needs the GitHub CLI (`gh auth login`). GitLab (`--source gitlab`, with
+--org set to a group path such as `my-group` or `my-group/sub`) needs the GitLab CLI
+(`glab auth login`, or a GITLAB_TOKEN with read_api); merge requests are treated as PRs.
+No other dependencies.
 
 Usage:
     python ai_pr_report.py --org my-org                  # last 12 months
+    python ai_pr_report.py --source gitlab --org my-group   # a GitLab group (merge requests)
     python ai_pr_report.py --org my-org --since 2026-01-01           # only PRs created since
     python ai_pr_report.py --classify all              # classify purpose of every PR, not just AI ones
     python ai_pr_report.py --since all                  # everything (slow: rate limits)
@@ -38,6 +41,7 @@ import os
 import sys
 import threading
 import time
+from urllib.parse import quote
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, asdict
 
@@ -82,7 +86,7 @@ TOOLS: dict[str, dict[str, list[str]]] = {
 
 # Automation accounts whose PRs aren't developer work (dependency bumps etc.). Their PRs are
 # excluded unless --include-bots is given; AI agents (Claude/Copilot/Cursor) are never excluded.
-NON_AI_BOT_RE = re.compile(r"\[bot\]$|^(dependabot|renovate|github-actions|snyk-bot|azure-pipelines)$", re.I)
+NON_AI_BOT_RE = re.compile(r"\[bot\]$|_bot_[0-9a-f]+$|^(dependabot|renovate|github-actions|snyk-bot|azure-pipelines)$", re.I)
 
 COMPILED = {
     tool: {kind: [re.compile(p, re.I) for p in pats] for kind, pats in rules.items()}
@@ -246,12 +250,14 @@ query($owner: String!, $name: String!, $cursor: String, $first: Int!) {
 
 def fetch_prs(org: str, repo: str, since: dt.datetime | None, cache_dir: str | None, cache_hours: float) -> list[PR]:
     since_key = f"{since:%Y-%m-%d}" if since else "all"
-    path = os.path.join(cache_dir, f"{org}__{repo}__{since_key}.json") if cache_dir else None
+    prefix = "" if SOURCE == "github" else f"{SOURCE}__"
+    fname = f"{prefix}{org}__{repo}__{since_key}.json".replace("/", "_")
+    path = os.path.join(cache_dir, fname) if cache_dir else None
     if path and os.path.exists(path) and time.time() - os.path.getmtime(path) < cache_hours * 3600:
         with open(path, encoding="utf-8") as f:
             nodes = json.load(f)
     else:
-        nodes = fetch_pr_nodes(org, repo, since)
+        nodes = fetch_gitlab_nodes(org, repo) if SOURCE == "gitlab" else fetch_pr_nodes(org, repo, since)
         if path:
             os.makedirs(cache_dir, exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
@@ -292,6 +298,95 @@ def fetch_pr_nodes(org: str, repo: str, since: dt.datetime | None) -> list[dict]
 
 
 # --------------------------------------------------------------------------- #
+# GitLab access via glab CLI (merge requests are normalised to the GitHub node shape)
+# --------------------------------------------------------------------------- #
+
+SOURCE = "github"  # set from --source
+WEB_BASE = {"github": "https://github.com", "gitlab": "https://gitlab.com"}
+_gl_projects: dict[str, list[dict]] = {}  # project path (relative to the group) -> merge requests
+
+
+def glab(args: list[str], retries: int = 6) -> str:
+    for attempt in range(retries):
+        res = subprocess.run(["glab", *args], capture_output=True, text=True, encoding="utf-8")
+        if res.returncode == 0:
+            return res.stdout
+        err = (res.stdout + res.stderr).strip()
+        if attempt < retries - 1 and re.search(r"429|rate limit|50[234]|timed? ?out", err, re.I):
+            time.sleep(5 * (attempt + 1))
+            continue
+        raise RuntimeError(f"glab {' '.join(args[:2])} failed: {err[:300]}")
+    raise RuntimeError("unreachable")
+
+
+def _json_values(text: str) -> list:
+    """`glab api --paginate` prints one JSON array per page; merge them."""
+    dec, i, out = json.JSONDecoder(), 0, []
+    while True:
+        while i < len(text) and text[i].isspace():
+            i += 1
+        if i >= len(text):
+            return out
+        obj, i = dec.raw_decode(text, i)
+        out.extend(obj) if isinstance(obj, list) else out.append(obj)
+
+
+def load_gitlab_group(group: str, since: dt.datetime | None, include_archived: bool) -> list[str]:
+    """List the group's merge requests in one call; this also tells us which projects have any."""
+    query = (f"groups/{quote(group, safe='')}/merge_requests?per_page=100&state=all&scope=all"
+             f"&order_by=created_at&sort=desc&non_archived={'false' if include_archived else 'true'}")
+    if since:
+        query += f"&created_after={since:%Y-%m-%dT%H:%M:%SZ}"
+    prefix = group.lower() + "/"
+    _gl_projects.clear()
+    for mr in _json_values(glab(["api", "--paginate", query])):
+        full = mr["references"]["full"].rsplit("!", 1)[0]
+        rel = full[len(prefix):] if full.lower().startswith(prefix) else full
+        _gl_projects.setdefault(rel, []).append(mr)
+    return sorted(_gl_projects, key=str.lower)
+
+
+def _gitlab_commit(project_id: int, c: dict) -> dict:
+    merge = len(c.get("parent_ids") or []) > 1
+    added = 0
+    if not merge:  # merge commits are skipped by classify(); don't spend a call on them
+        try:
+            info = json.loads(glab(["api", f"projects/{project_id}/repository/commits/{c['id']}"]))
+            added = (info.get("stats") or {}).get("additions") or 0
+        except Exception:
+            pass  # commit no longer reachable (squashed / branch deleted): count as 0 lines
+    return {"commit": {
+        "message": c.get("message") or c.get("title") or "",
+        "additions": added,
+        "parents": {"totalCount": 2 if merge else 1},
+        "author": {"name": c.get("author_name"), "email": c.get("author_email")},
+    }}
+
+
+def _gitlab_node(mr: dict) -> dict:
+    pid, iid = mr["project_id"], mr["iid"]
+    commits = _json_values(glab(["api", f"projects/{pid}/merge_requests/{iid}/commits?per_page=100"]))
+    with cf.ThreadPoolExecutor(max_workers=4) as pool:
+        nodes = list(pool.map(lambda c: _gitlab_commit(pid, c), commits[:40]))
+    state = {"opened": "OPEN", "merged": "MERGED"}.get(mr["state"], "CLOSED")
+    merged_at = None
+    if state == "MERGED":
+        merged_at = mr.get("merged_at") or mr.get("closed_at") or mr.get("updated_at")
+    return {
+        "number": iid, "title": mr.get("title"), "url": mr["web_url"], "state": state,
+        "createdAt": mr["created_at"], "mergedAt": merged_at, "headRefName": mr.get("source_branch"),
+        "body": mr.get("description"),
+        "additions": sum(n["commit"]["additions"] for n in nodes),
+        "author": {"login": (mr.get("author") or {}).get("username")},
+        "commits": {"totalCount": len(commits), "nodes": nodes},
+    }
+
+
+def fetch_gitlab_nodes(group: str, project: str) -> list[dict]:
+    return [_gitlab_node(mr) for mr in _gl_projects.get(project, [])]
+
+
+# --------------------------------------------------------------------------- #
 # Purpose classification with headless Claude (`claude -p`)
 # --------------------------------------------------------------------------- #
 
@@ -329,7 +424,7 @@ def _classify_prompt(batch: list[PR]) -> str:
         return f"[{i}] repo: {p.repo} | branch: {p.branch}\ntitle: {p.title}\ndescription: {desc}\ncommits: {commits}"
     prs = "\n\n".join(one(i, p) for i, p in enumerate(batch))
     return (
-        "Classify each GitHub pull request below by the main kind of work it contains. "
+        "Classify each pull/merge request below by the main kind of work it contains. "
         "Text may be in Dutch or English. Pick exactly one category per PR; when a PR mixes kinds, "
         "pick the dominant one.\n\nCategories:\n" + cats +
         "\n\nReturn one item per PR, using the number in brackets as id.\n\n" + prs
@@ -716,7 +811,7 @@ def render_html(org: str, prs: list[PR], repos: list[str], since: dt.datetime | 
         rows.append(
             f'<tr class="repo{" has-ai" if a else ""}" data-repo="{esc(r.lower())}" data-total="{n}" data-ai="{a}" '
             f'data-pct="{pct(a, n):.4f}" data-code="{code_pct:.4f}">'
-            f'<td><span class="caret">{"▸" if a else ""}</span><a href="https://github.com/{esc(org)}/{esc(r)}" target="_blank" rel="noopener">{esc(r)}</a>{err}</td>'
+            f'<td><span class="caret">{"▸" if a else ""}</span><a href="{WEB_BASE[SOURCE]}/{esc(org)}/{esc(r)}" target="_blank" rel="noopener">{esc(r)}</a>{err}</td>'
             f'<td class="num">{a}</td><td class="num">{n}</td><td class="num">{pct(a, n):.1f}%</td>'
             f'<td class="num" title="{ral:,} of {rl:,} lines added">{fmt_pct(code_pct if rl else None)}</td>'
             f'<td><div class="stack">{stack}</div><div class="chips">{chips}</div></td><td>{uses}</td></tr>{details}'
@@ -886,8 +981,10 @@ def main() -> int:
         sys.stderr.reconfigure(encoding="utf-8")
     except Exception:
         pass
-    ap = argparse.ArgumentParser(description="Report AI-assisted PRs per repository of a GitHub org.")
-    ap.add_argument("--org", required=True, help="GitHub organization to scan")
+    ap = argparse.ArgumentParser(description="Report AI-assisted PRs per repository of a GitHub org or GitLab group.")
+    ap.add_argument("--source", choices=["github", "gitlab"], default="github",
+                    help="Where to read from (default github). For gitlab, merge requests are treated as PRs")
+    ap.add_argument("--org", required=True, help="GitHub organization, or GitLab group path (e.g. my-group/sub)")
     ap.add_argument("--since", default=None,
                     help="Only PRs created on/after this date (YYYY-MM-DD), or 'all'. Default: 12 months ago")
     ap.add_argument("--cache-dir", default=".cache", help="Per-repo cache of fetched PRs (default .cache; '' disables)")
@@ -913,7 +1010,14 @@ def main() -> int:
         today = dt.date.today()
         args.since = f"{today.year - 1:04d}-{today.month:02d}-01"
     since = None if args.since == "all" else dt.datetime.fromisoformat(args.since).replace(tzinfo=dt.timezone.utc)
-    repos = args.repos or list_repos(args.org, args.include_archived, args.include_forks)
+    global SOURCE
+    SOURCE = args.source
+    if SOURCE == "gitlab":
+        repos = load_gitlab_group(args.org, since, args.include_archived)
+        if args.repos:
+            repos = [r for r in repos if r in args.repos or r.rsplit("/", 1)[-1] in args.repos]
+    else:
+        repos = args.repos or list_repos(args.org, args.include_archived, args.include_forks)
     print(f"Scanning {len(repos)} repositories in {args.org}...", file=sys.stderr)
 
     prs: list[PR] = []
