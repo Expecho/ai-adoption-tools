@@ -149,6 +149,46 @@ class RepoStatsTests(unittest.TestCase):
         self.assertEqual(a.repo_labels(["o/A", "p/B"]), {"o/A": "o/A", "p/B": "p/B"})
 
 
+def rel_child(i):
+    return {"rel": "System.LinkTypes.Hierarchy-Forward", "url": f"https://dev.azure.com/o/p/_apis/wit/workItems/{i}"}
+
+
+def rel_pr(guid, n):
+    return {"rel": "ArtifactLink", "url": f"vstfs:///GitHub/PullRequest/{guid}%2f{n}",
+            "attributes": {"name": "GitHub Pull Request", "resourceCreatedDate": "2026-01-01T00:00:00Z"}}
+
+
+class FakeAdo:
+    """workitemsbatch stub: id -> work item."""
+    def __init__(self, items):
+        self.items, self.calls = items, []
+
+    def request(self, path, body=None):
+        self.calls.append(body["ids"])
+        return {"value": [self.items[i] for i in body["ids"] if i in self.items]}
+
+
+class DescendantTests(unittest.TestCase):
+    def test_links_on_child_tasks_are_collected_with_their_origin(self):
+        story = {"id": 1, "rev": 3, "fields": {"System.CreatedDate": "2026-01-01T00:00:00Z", "System.Title": "t"},
+                 "relations": [rel_child(2), rel_child(3), rel_pr("a1", 10)]}
+        items = {2: {"id": 2, "relations": [rel_pr("a1", 11), rel_child(4)]},
+                 3: {"id": 3, "relations": []},
+                 4: {"id": 4, "relations": [rel_pr("a1", 12), rel_pr("a1", 11)]}}   # grandchild; 11 repeats
+        d = a.fetch_descendants(FakeAdo(items), [story])
+        self.assertEqual(sorted(w["id"] for w in d[1]), [2, 3, 4])
+        events = a.state_timeline("2026-01-01T00:00:00Z", [upd(1, "2026-01-01T00:00:00Z", "New"), upd(2, "2026-01-02T00:00:00Z", "Done")])
+        st = a.build_story(story, events, "https://dev.azure.com/o", CATS, d[1])
+        got = {(l["url"].rsplit("%2f", 1)[1], l["via"]) for l in st.pr_links}
+        self.assertEqual(got, {("10", 1), ("11", 2), ("12", 4)})   # de-duplicated, keeps the first holder
+
+    def test_depth_is_limited_and_unknown_children_are_skipped(self):
+        story = {"id": 1, "relations": [rel_child(2), rel_child(99)]}
+        items = {2: {"id": 2, "relations": [rel_child(3)]}, 3: {"id": 3, "relations": [rel_child(4)]}, 4: {"id": 4, "relations": []}}
+        d = a.fetch_descendants(FakeAdo(items), [story], depth=2)
+        self.assertEqual(sorted(w["id"] for w in d[1]), [2, 3])
+
+
 class StatsTests(unittest.TestCase):
     def test_median_and_p90(self):
         self.assertEqual(a.med([1, 2, 10]), 2)

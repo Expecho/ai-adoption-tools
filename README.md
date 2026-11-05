@@ -89,7 +89,7 @@ Looks at the user stories (or another work item type) that reached `Done` and re
 - the same figures split into AI-assisted, not AI and no PR data, plus trend charts, a per-month table and a filterable story list
 - a per-repository breakdown next to the overall figures: a story belongs to the repositories of its matched PRs (once in each) and is AI in a repository when that repository's PR is AI-assisted
 
-A story counts as AI-assisted when one of its linked pull / merge requests is AI-assisted in the JSON written by `ai_pr_report.py --json`, so run that first. Stories without a linked PR found in that data are shown as "no PR data" rather than "not AI". GitHub PR links created by Azure Boards (which only contain a repository id and a PR number) are matched by PR number plus creation time; GitLab merge request links and plain URLs match directly. Azure Repos pull requests are not matched.
+A story counts as AI-assisted when one of its linked pull / merge requests (on the story itself or on its child tasks, since developers usually link from the task) is AI-assisted in the JSON written by `ai_pr_report.py --json`, so run that first. Stories without a linked PR found in that data are shown as "no PR data" rather than "not AI". GitHub PR links created by Azure Boards (which only contain a repository id and a PR number) are matched by PR number plus creation time; GitLab merge request links and plain URLs match directly. Azure Repos pull requests are not matched.
 
 ```sh
 python src/backlog-reports/ado_story_report.py                          # org/project from `az devops configure`

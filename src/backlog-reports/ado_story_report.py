@@ -161,7 +161,7 @@ class Story:
     phase_days: dict[str, float] = field(default_factory=dict)      # created / committed -> days
     lead_days: float = 0.0
     reopened: bool = False
-    pr_links: list[dict] = field(default_factory=list)   # {url, created}: PR/MR links on the story
+    pr_links: list[dict] = field(default_factory=list)   # {url, created, via}: PR/MR links on the story or its child items (via = work item id)
     pr_matched: list[str] = field(default_factory=list)
     ai_prs: list[str] = field(default_factory=list)
     repos: list[str] = field(default_factory=list)       # repositories of the matched PRs
@@ -190,14 +190,14 @@ PR_URL_RE = re.compile(r"https?://[^\s\"']+?(/pull/\d+|/-/merge_requests/\d+|/pu
 GH_PR_RE = re.compile(r"^vstfs:///GitHub/PullRequest/([0-9a-f-]+)%2f(\d+)$", re.I)
 
 
-def pr_links(relations: list[dict]) -> list[dict]:
+def pr_links(relations: list[dict], via: int | None = None) -> list[dict]:
     out: dict[str, dict] = {}
     for r in relations or []:
         url = r.get("url") or ""
         attrs = r.get("attributes") or {}
         name = attrs.get("name") or ""
         if PR_URL_RE.search(url) or (r.get("rel") == "ArtifactLink" and "pull request" in name.lower()):
-            out.setdefault(url, {"url": url, "created": attrs.get("resourceCreatedDate")})
+            out.setdefault(url, {"url": url, "created": attrs.get("resourceCreatedDate"), "via": via})
     return list(out.values())
 
 
@@ -257,7 +257,8 @@ def state_timeline(created: str, updates: list[dict]) -> list[tuple[dt.datetime,
     return events
 
 
-def build_story(wi: dict, events: list[tuple[dt.datetime, str]], org_url: str, categories: dict[str, str]) -> Story | None:
+def build_story(wi: dict, events: list[tuple[dt.datetime, str]], org_url: str, categories: dict[str, str],
+                descendants: list[dict] | None = None) -> Story | None:
     f = wi["fields"]
     if not events or events[-1][1] != "Done":
         return None
@@ -279,7 +280,9 @@ def build_story(wi: dict, events: list[tuple[dt.datetime, str]], org_url: str, c
         phase_days={"created": round(phases.get("created", 0.0), 2), "committed": round(phases.get("committed", 0.0), 2)},
         lead_days=round(days(created, done_at), 2),
         reopened=sum(1 for _, st in events if st == "Done") > 1,
-        pr_links=pr_links(wi.get("relations") or []),
+        pr_links=list({l["url"]: l for l in
+                       pr_links(wi.get("relations") or [], wi["id"])
+                       + [l for d in descendants or [] for l in pr_links(d.get("relations") or [], d["id"])]}.values()),
     )
 
 
@@ -302,6 +305,34 @@ def fetch_items(ado: Ado, ids: list[int]) -> list[dict]:
     with cf.ThreadPoolExecutor(max_workers=4) as pool:
         parts = pool.map(lambda c: ado.request("_apis/wit/workitemsbatch", {"ids": c, "$expand": "relations"}).get("value", []), chunks)
         return [wi for part in parts for wi in part]
+
+
+def fetch_descendants(ado: Ado, items: list[dict], depth: int = 3) -> dict[int, list[dict]]:
+    """story id -> the work items below it (tasks, and anything under those), with their relations.
+    Developers usually link a pull request from the task, not from the story itself."""
+    child_ids = lambda wi: [int(r["url"].rsplit("/", 1)[1]) for r in wi.get("relations") or []
+                            if r.get("rel") == "System.LinkTypes.Hierarchy-Forward"]
+    owner: dict[int, int] = {}
+    for wi in items:
+        for c in child_ids(wi):
+            owner.setdefault(c, wi["id"])
+    found: dict[int, list[dict]] = defaultdict(list)
+    seen: set[int] = set()
+    level = list(owner)
+    for _ in range(depth):
+        level = [i for i in level if i not in seen]
+        if not level:
+            break
+        seen.update(level)
+        nxt = []
+        for w in fetch_items(ado, level):
+            found[owner[w["id"]]].append(w)
+            for c in child_ids(w):
+                if c not in owner:
+                    owner[c] = owner[w["id"]]
+                    nxt.append(c)
+        level = nxt
+    return found
 
 
 def fetch_updates(ado: Ado, wid: int) -> list[dict]:
@@ -855,7 +886,8 @@ def main() -> int:
     cats_raw = ado.request(f"{urllib.parse.quote(args.project)}/_apis/wit/workitemtypes/{urllib.parse.quote(args.type)}/states").get("value", [])
     categories = {s["name"]: s.get("category") or "" for s in cats_raw}
     items = fetch_items(ado, ids)
-    print(f"Fetched {len(items)} work items; reading state history...", file=sys.stderr)
+    descendants = fetch_descendants(ado, items)
+    print(f"Fetched {len(items)} work items and {sum(len(v) for v in descendants.values())} child items; reading state history...", file=sys.stderr)
 
     cache_path = os.path.join(args.cache_dir, f"ado_{args.org}_{args.project}_updates.json") if args.cache_dir else None
     cache: dict[str, dict] = {}
@@ -877,7 +909,7 @@ def main() -> int:
         for i, fut in enumerate(cf.as_completed(futs), 1):
             wi = futs[fut]
             try:
-                st = build_story(wi, fut.result(), org_url, categories)
+                st = build_story(wi, fut.result(), org_url, categories, descendants.get(wi["id"]))
             except Exception as e:
                 print(f"  #{wi['id']}: ERROR {e}", file=sys.stderr)
                 continue
