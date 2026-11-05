@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import contextlib
 import datetime as dt
 import html
 import json
@@ -1137,18 +1138,29 @@ def resolve_scopes(flt: rc.Filter, discover, what: str) -> list[str]:
 
 
 def resolve_targets(cfg: rc.Config, since: dt.datetime | None, include_archived: bool, include_forks: bool) -> list[Target]:
-    targets: dict[tuple[str, str], Target] = {}
-    if cfg.github:
+    def github() -> list[Target]:
+        out = []
         for org in resolve_scopes(cfg.github.scopes, discover_github_orgs, "org"):
             for name in list_repos(org, include_archived, include_forks):
                 path = f"{org}/{name}"
                 if cfg.github.repos.allows(path):
-                    targets.setdefault(("github", path.lower()), Target("github", org, path))
-    if cfg.gitlab:
+                    out.append(Target("github", org, path))
+        return out
+
+    def gitlab() -> list[Target]:
+        out = []
         for group in resolve_scopes(cfg.gitlab.scopes, discover_gitlab_groups, "group"):
             for path in load_gitlab_group(group, since, include_archived):
                 if cfg.gitlab.repos.allows(path):
-                    targets.setdefault(("gitlab", path.lower()), Target("gitlab", group, path))
+                    out.append(Target("gitlab", group, path))
+        return out
+
+    jobs = [fn for fn, enabled in ((github, cfg.github), (gitlab, cfg.gitlab)) if enabled]
+    with cf.ThreadPoolExecutor(max_workers=max(1, len(jobs))) as pool:  # providers are listed in parallel
+        found = [t for result in [f.result() for f in [pool.submit(fn) for fn in jobs]] for t in result]
+    targets: dict[tuple[str, str], Target] = {}
+    for t in found:
+        targets.setdefault((t.source, t.path.lower()), t)
     return sorted(targets.values(), key=lambda t: (t.source, t.path.lower()))
 
 
@@ -1228,8 +1240,11 @@ def main() -> int:
 
     prs: list[PR] = []
     errors: dict[str, str] = {}
-    with cf.ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(fetch_prs, t, since, args.cache_dir or None, args.cache_hours): t for t in targets}
+    # One pool per provider so GitHub and GitLab are fetched at the same time, each with `workers` threads.
+    with contextlib.ExitStack() as stack:
+        pools = {src: stack.enter_context(cf.ThreadPoolExecutor(max_workers=workers))
+                 for src in sorted({t.source for t in targets})}
+        futs = {pools[t.source].submit(fetch_prs, t, since, args.cache_dir or None, args.cache_hours): t for t in targets}
         for i, fut in enumerate(cf.as_completed(futs), 1):
             t = futs[fut]
             try:
