@@ -164,6 +164,8 @@ class Story:
     pr_links: list[dict] = field(default_factory=list)   # {url, created}: PR/MR links on the story
     pr_matched: list[str] = field(default_factory=list)
     ai_prs: list[str] = field(default_factory=list)
+    repos: list[str] = field(default_factory=list)       # repositories of the matched PRs
+    ai_repos: list[str] = field(default_factory=list)    # ...of which have an AI-assisted PR for this story
     ai: str = "nodata"             # "ai" | "human" | "nodata"
 
 
@@ -370,6 +372,7 @@ CHART_CSS = r"""
   border-radius:8px; padding:8px 10px; font-size:12px; box-shadow:0 4px 16px rgba(0,0,0,.15); display:none; max-width:260px }
 #tip .t { color:var(--muted); margin-bottom:4px } #tip .r { display:flex; align-items:center; gap:8px; white-space:nowrap }
 #tip .k { width:10px; height:3px; border-radius:2px; flex:none } #tip b { font-variant-numeric:tabular-nums }
+tr.overall td { background:var(--bg); border-bottom:2px solid var(--axis) }
 .tag { color:var(--fg); background:var(--card); border:1px solid var(--line); display:inline-flex; align-items:center; gap:5px; padding:0 8px }
 .tag.ai, .tag.human, .tag.nodata { background:var(--card) }
 .tag::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--c) }
@@ -546,7 +549,36 @@ CHART_JS = r"""
     el('line', { x1: m.l, x2: m.l, y1: m.t, y2: H - m.b, style: 'stroke:var(--axis);stroke-width:1' }, svg);
   }
 
-  var hosts = [[document.getElementById('c1'), columns], [document.getElementById('c2'), line], [document.getElementById('c3'), bars]];
+  // 4. Stacked horizontal bars: stories per repository (top 15), AI-assisted vs not AI
+  function repos(host) {
+    host.textContent = '';
+    var rows = D.repos, W = host.clientWidth || 600, bh = 16, rg = 10, m = { l: 190, r: 52, t: 4, b: 4 };
+    var H = m.t + m.b + Math.max(1, rows.length) * (bh + rg) - rg;
+    var sc = niceScale(Math.max.apply(null, rows.map(function (r) { return r.ai + r.human; }).concat([1])));
+    var pw = W - m.l - m.r, svg = el('svg', { width: W, height: H, viewBox: '0 0 ' + W + ' ' + H }, host);
+    el('line', { x1: m.l, x2: m.l, y1: m.t, y2: H - m.b, style: 'stroke:var(--axis);stroke-width:1' }, svg);
+    rows.forEach(function (r, i) {
+      var y = m.t + i * (bh + rg), total = r.ai + r.human, x = m.l;
+      var name = r.name.length > 30 ? r.name.slice(0, 29) + '…' : r.name;
+      text(svg, m.l - 10, y + bh / 2 + 4, name, 'end');
+      [['ai', 'var(--c-ai)'], ['human', 'var(--c-human)']].forEach(function (s, j, arr) {
+        var v = r[s[0]]; if (!v) return;
+        var w = v / sc.max * pw - (x > m.l ? 2 : 0), last = (j === arr.length - 1) || !r[arr[j + 1][0]];
+        if (w <= 0) return;
+        var x0 = x > m.l ? x + 2 : x, rr = last ? Math.min(4, w, bh / 2) : 0;
+        el('path', { d: 'M' + x0 + ',' + y + 'H' + (x0 + w - rr) + (rr ? 'Q' + (x0 + w) + ',' + y + ' ' + (x0 + w) + ',' + (y + rr) + 'V' + (y + bh - rr) +
+          'Q' + (x0 + w) + ',' + (y + bh) + ' ' + (x0 + w - rr) + ',' + (y + bh) : 'V' + (y + bh)) + 'H' + x0 + 'Z', style: 'fill:' + s[1] }, svg);
+        x = x0 + w;
+      });
+      text(svg, x + 6, y + bh / 2 + 4, String(total), 'start', 'val');
+      var hit = el('rect', { class: 'hit', x: 0, y: y - rg / 2, width: W, height: bh + rg }, svg);
+      wire(hit, r.full, [{ key: 'var(--c-ai)', label: 'AI-assisted', value: String(r.ai) },
+        { key: 'var(--c-human)', label: 'Not AI', value: String(r.human) },
+        { key: null, label: 'AI share', value: (100 * r.ai / total).toFixed(0) + '%' }]);
+    });
+  }
+
+  var hosts = [[document.getElementById('c1'), columns], [document.getElementById('c2'), line], [document.getElementById('c3'), bars], [document.getElementById('c4'), repos]];
   function draw() { hosts.forEach(function (h) { if (h[0]) h[1](h[0]); }); }
   draw();
   if (window.ResizeObserver) { var t; new ResizeObserver(function () { clearTimeout(t); t = setTimeout(draw, 80); }).observe(document.querySelector('main')); }
@@ -575,7 +607,35 @@ def chart_data(stories: list[Story]) -> dict:
         r = lambda v: None if v is None else round(v, 2)
         phases[k] = {"n": len(g), "created": r(med([s.phase_days["created"] for s in g])),
                      "committed": r(med([s.phase_days["committed"] for s in g])), "lead": r(med([s.lead_days for s in g]))}
-    return {"months": rows, "phases": phases}
+    rs = repo_stats(stories)[:15]
+    labels = repo_labels(r["repo"] for r in rs)
+    repos = [{"name": labels[r["repo"]], "full": r["repo"], "ai": r["ai"], "human": r["human"]} for r in rs]
+    return {"months": rows, "phases": phases, "repos": repos}
+
+
+def repo_labels(repos) -> dict[str, str]:
+    """Short names: drop the org / group prefix when every repository shares it."""
+    repos = list(repos)
+    heads = {r.split("/", 1)[0] for r in repos}
+    return {r: (r.split("/", 1)[1] if len(heads) == 1 and "/" in r else r) for r in repos}
+
+
+def summarize(g: list[Story], ai: list[Story], human: list[Story]) -> dict:
+    return {"n": len(g), "ai": len(ai), "human": len(human),
+            "pct": 100.0 * len(ai) / len(g) if g else None,
+            "created": med([s.phase_days["created"] for s in g]), "committed": med([s.phase_days["committed"] for s in g]),
+            "lead": med([s.lead_days for s in g]),
+            "lead_ai": med([s.lead_days for s in ai]), "lead_human": med([s.lead_days for s in human])}
+
+
+def repo_stats(stories: list[Story]) -> list[dict]:
+    """One row per repository: stories whose matched PRs touch it. A story with PRs in several
+    repositories counts once in each, and is AI in a repository when that repository's PR is AI-assisted."""
+    out = []
+    for r in sorted({r for s in stories for r in s.repos}):
+        g = [s for s in stories if r in s.repos]
+        out.append({"repo": r, **summarize(g, [s for s in g if r in s.ai_repos], [s for s in g if r not in s.ai_repos])})
+    return sorted(out, key=lambda x: (-x["n"], x["repo"].lower()))
 
 
 LABEL = {"ai": "AI-assisted", "human": "Not AI (PRs checked)", "nodata": "No PR data"}
@@ -636,18 +696,40 @@ def render(org: str, project: str, wtype: str, stories: list[Story], states: lis
                         f"<td class='num'>{fd(gs['committed'])}</td><td class='num'>{fd(gs['lead'])}</td></tr>")
         return "".join(rows)
 
+    def repo_rows() -> str:
+        rs = repo_stats(stories)
+        labels = repo_labels(r["repo"] for r in rs)
+        known_stories = [s for s in stories if s.repos]
+        overall = summarize(known_stories, [s for s in known_stories if s.ai == "ai"], [s for s in known_stories if s.ai == "human"])
+        norepo = [s for s in stories if not s.repos]
+        pc = lambda v: "–" if v is None else f"{v:.1f}%"
+        cells = lambda x: (f"<td class='num'>{x['n']:,}</td><td class='num'>{x['ai']:,}</td><td class='num'>{x['human']:,}</td>"
+                           f"<td class='num'><b>{pc(x['pct'])}</b></td>"
+                           f"<td class='num'>{fd(x['created'])}</td><td class='num'>{fd(x['committed'])}</td>"
+                           f"<td class='num'>{fd(x['lead'])}</td><td class='num'>{fd(x['lead_ai'])}</td><td class='num'>{fd(x['lead_human'])}</td>")
+        out = [f"<tr class='overall'><td><b>Overall</b> <span class='muted'>(stories with PR data)</span></td>{cells(overall)}</tr>"]
+        for x in rs:
+            out.append(f"<tr data-q='{esc(x['repo'].lower())}'><td title='{esc(x['repo'])}'>{esc(labels[x['repo']])}</td>{cells(x)}</tr>")
+        if norepo:
+            g = summarize(norepo, [], [])
+            out.append(f"<tr class='muted'><td>No repository <span class='muted'>(no PR data)</span></td><td class='num'>{g['n']:,}</td>"
+                       f"<td class='num'>–</td><td class='num'>–</td><td class='num'>–</td><td class='num'>{fd(g['created'])}</td>"
+                       f"<td class='num'>{fd(g['committed'])}</td><td class='num'>{fd(g['lead'])}</td><td class='num'>–</td><td class='num'>–</td></tr>")
+        return "".join(out)
+
     def story_rows() -> str:
         out = []
         for s in sorted(stories, key=lambda s: s.done, reverse=True):
             tag = {"ai": "AI", "human": "no AI", "nodata": "no PR data"}[s.ai]
             out.append(
-                f"<tr data-q='{esc((str(s.id) + ' ' + s.title).lower())}'>"
+                f"<tr data-q='{esc((str(s.id) + ' ' + s.title + ' ' + ' '.join(s.repos)).lower())}'>"
                 f"<td><a href='{esc(s.url)}' target='_blank' rel='noopener'>#{s.id}</a> {esc(s.title)}"
                 f"{' <span class=muted>(reopened)</span>' if s.reopened else ''}</td>"
                 f"<td>{s.done[:10]}</td><td class='num'>{fd(s.phase_days['created'])}</td>"
                 f"<td class='num'>{fd(s.phase_days['committed'])}</td><td class='num'>{fd(s.lead_days)}</td>"
                 f"<td><span class='tag {s.ai}'>{tag}</span></td>"
-                f"<td class='num'>{len(s.pr_matched)}/{len(s.pr_links)}</td></tr>")
+                f"<td class='num'>{len(s.pr_matched)}/{len(s.pr_links)}</td>"
+                f"<td class='muted'>{esc(', '.join(repo_labels(s.repos).values()))}</td></tr>")
         return "".join(out)
 
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -689,6 +771,9 @@ input {{ padding:6px 10px; border:1px solid var(--line); border-radius:8px; back
   <section class="card chart"><h3>Median days per phase</h3><p class="muted">AI-assisted vs not AI; stories without PR data are left out</p>
     <div class="legend"><span class="lk"><i style="background:var(--c-ai)"></i>AI-assisted</span><span class="lk"><i style="background:var(--c-human)"></i>Not AI (PRs checked)</span></div>
     <div id="c3" class="host"></div></section>
+  <section class="card chart"><h3>Stories per repository</h3><p class="muted">Top 15 repositories by stories with a matched PR; the table below lists them all</p>
+    <div class="legend"><span class="lk"><i style="background:var(--c-ai)"></i>AI-assisted</span><span class="lk"><i style="background:var(--c-human)"></i>Not AI (PRs checked)</span></div>
+    <div id="c4" class="host"></div></section>
 </div>
 <p class="muted">Hover or focus a column, point or bar for its values. The same numbers are in the tables below.</p>
 <div id="tip" role="tooltip"></div>
@@ -706,13 +791,23 @@ input {{ padding:6px 10px; border:1px solid var(--line); border-radius:8px; back
 <h2>Per month (by done date)</h2>
 <div class="wrap"><table><tr><th>Month</th><th class="num">Done</th><th class="num">AI</th><th class="num">With PR data</th><th class="num">% AI</th><th class="num">Created d</th><th class="num">Committed d</th><th class="num">Lead d</th></tr>{month_rows()}</table></div>
 
+<h2>Per repository</h2>
+<p><input id="rq" placeholder="Filter repositories"></p>
+<div class="wrap"><table id="rt"><tr><th rowspan="2">Repository</th><th class="num" colspan="3">Stories</th><th class="num" rowspan="2">% AI</th><th class="num" colspan="3">Median days</th><th class="num" colspan="2">Lead time</th></tr>
+<tr><th class="num">total</th><th class="num">AI</th><th class="num">not AI</th><th class="num">created</th><th class="num">committed</th><th class="num">lead</th><th class="num">AI</th><th class="num">not AI</th></tr>{repo_rows()}</table></div>
+<p class="muted">A story counts once in every repository its linked PRs touch, so the rows can add up to more than the overall row. A story is AI in a repository when that repository's PR is AI-assisted. Stories without a matched PR have no repository.</p>
+
 <h2>Stories</h2>
 <p><input id="q" placeholder="Filter by id or title"></p>
-<div class="wrap"><table id="t"><tr><th>Story</th><th>Done</th><th class="num">Created d</th><th class="num">Committed d</th><th class="num">Lead d</th><th>AI</th><th class="num">PRs found/linked</th></tr>{story_rows()}</table></div>
+<div class="wrap"><table id="t"><tr><th>Story</th><th>Done</th><th class="num">Created d</th><th class="num">Committed d</th><th class="num">Lead d</th><th>AI</th><th class="num">PRs found/linked</th><th>Repositories</th></tr>{story_rows()}</table></div>
 <script>
 document.getElementById('q').addEventListener('input', e => {{
   const q = e.target.value.toLowerCase();
   document.querySelectorAll('#t tr[data-q]').forEach(r => r.hidden = !r.dataset.q.includes(q));
+}});
+document.getElementById('rq').addEventListener('input', e => {{
+  const q = e.target.value.toLowerCase();
+  document.querySelectorAll('#rt tr[data-q]').forEach(r => r.hidden = !r.dataset.q.includes(q));
 }});
 </script>
 </main><script>{CHART_JS}</script></body></html>"""
@@ -802,6 +897,12 @@ def main() -> int:
     for s in stories:
         s.ai_prs = [u for u in s.pr_matched if prs[norm_url(u)].get("ai")]
         s.ai = "ai" if s.ai_prs else ("human" if s.pr_matched else "nodata")
+        per_repo: dict[str, bool] = {}
+        for u in s.pr_matched:
+            pr = prs[norm_url(u)]
+            per_repo[pr["repo"]] = per_repo.get(pr["repo"], False) or bool(pr.get("ai"))
+        s.repos = sorted(per_repo)
+        s.ai_repos = sorted(r for r, is_ai in per_repo.items() if is_ai)
 
     states = [n for n, c in sorted(categories.items(), key=lambda kv: list(categories).index(kv[0])) if n != "Done" and c != "Removed"]
     with open(args.out, "w", encoding="utf-8") as f:

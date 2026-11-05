@@ -86,7 +86,8 @@ Looks at the user stories (or another work item type) that reached `Done` and re
 
 - time per state (New, Approved, Refined, Committed, Testable, ...) with median, mean and P90
 - three phases: **created** (time in Proposed-category states), **committed** (InProgress-category states) and **lead time** (creation until done)
-- the same figures split into AI-assisted, not AI and no PR data, plus a per-month table and a filterable story list
+- the same figures split into AI-assisted, not AI and no PR data, plus trend charts, a per-month table and a filterable story list
+- a per-repository breakdown next to the overall figures: a story belongs to the repositories of its matched PRs (once in each) and is AI in a repository when that repository's PR is AI-assisted
 
 A story counts as AI-assisted when one of its linked pull / merge requests is AI-assisted in the JSON written by `ai_pr_report.py --json`, so run that first. Stories without a linked PR found in that data are shown as "no PR data" rather than "not AI". GitHub PR links created by Azure Boards (which only contain a repository id and a PR number) are matched by PR number plus creation time; GitLab merge request links and plain URLs match directly. Azure Repos pull requests are not matched.
 

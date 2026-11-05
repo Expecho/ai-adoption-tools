@@ -123,6 +123,32 @@ class ChartDataTests(unittest.TestCase):
         self.assertEqual(d["phases"]["human"], {"n": 0, "created": None, "committed": None, "lead": None})
 
 
+class RepoStatsTests(unittest.TestCase):
+    def story(self, repos, ai_repos, lead):
+        s = a.Story(id=1, title="t", url="u", created="2026-01-01T00:00:00+00:00", done="2026-02-01T00:00:00+00:00")
+        s.repos, s.ai_repos, s.lead_days = repos, ai_repos, lead
+        s.phase_days = {"created": 1.0, "committed": 2.0}
+        return s
+
+    def test_story_counts_in_every_repo_and_ai_is_per_repo(self):
+        rows = {r["repo"]: r for r in a.repo_stats([
+            self.story(["o/A"], ["o/A"], 10), self.story(["o/A"], [], 20), self.story(["o/A", "o/B"], ["o/B"], 30)])}
+        self.assertEqual((rows["o/A"]["n"], rows["o/A"]["ai"], rows["o/A"]["human"]), (3, 1, 2))
+        self.assertEqual((rows["o/B"]["n"], rows["o/B"]["ai"], rows["o/B"]["human"]), (1, 1, 0))
+        self.assertEqual(rows["o/A"]["lead_ai"], 10)
+        self.assertEqual(rows["o/A"]["lead_human"], 25)      # median of 20 and 30
+        self.assertIsNone(rows["o/B"]["lead_human"])
+        self.assertEqual(rows["o/B"]["pct"], 100.0)
+
+    def test_sorted_by_story_count_and_stories_without_repo_ignored(self):
+        rows = a.repo_stats([self.story([], [], 5), self.story(["o/B"], [], 1), self.story(["o/A"], [], 1), self.story(["o/A"], [], 1)])
+        self.assertEqual([r["repo"] for r in rows], ["o/A", "o/B"])
+
+    def test_labels_drop_shared_prefix_only(self):
+        self.assertEqual(a.repo_labels(["o/A", "o/B"]), {"o/A": "A", "o/B": "B"})
+        self.assertEqual(a.repo_labels(["o/A", "p/B"]), {"o/A": "o/A", "p/B": "p/B"})
+
+
 class StatsTests(unittest.TestCase):
     def test_median_and_p90(self):
         self.assertEqual(a.med([1, 2, 10]), 2)
