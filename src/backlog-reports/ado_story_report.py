@@ -351,6 +351,233 @@ def group_stats(stories: list[Story]) -> dict:
     }
 
 
+CHART_CSS = r"""
+:root { --surface:#fcfcfb; --grid:#e1e0d9; --axis:#c3c2b7; --ink2:#52514e; --muted-ink:#898781;
+  --c-ai:#2a78d6; --c-human:#898781; --c-nodata:#c3c2b7; }
+@media (prefers-color-scheme: dark) { :root { --surface:#1a1a19; --grid:#2c2c2a; --axis:#383835; --ink2:#c3c2b7;
+  --c-ai:#3987e5; --c-human:#898781; --c-nodata:#4a4944; } }
+.charts { display:grid; gap:16px; margin-top:8px }
+.chart { background:var(--surface); padding:16px 16px 8px }
+.chart h3 { font-size:14px; margin:0 } .chart p { margin:2px 0 8px }
+.legend { display:flex; gap:16px; flex-wrap:wrap; margin:0 0 6px; font-size:12px; color:var(--ink2) }
+.lk { display:inline-flex; align-items:center; gap:6px }
+.lk i { width:10px; height:10px; border-radius:2px; display:inline-block }
+.host { width:100%; position:relative } .host svg { display:block; overflow:visible }
+.host text { font:11px system-ui,-apple-system,"Segoe UI",sans-serif; fill:var(--muted-ink) }
+.host text.val { fill:var(--fg); font-weight:600 }
+.host .hit { fill:transparent; outline:none } .host .hit:focus-visible { stroke:var(--fg); stroke-width:1; rx:4 }
+#tip { position:fixed; z-index:10; pointer-events:none; background:var(--card); color:var(--fg); border:1px solid var(--line);
+  border-radius:8px; padding:8px 10px; font-size:12px; box-shadow:0 4px 16px rgba(0,0,0,.15); display:none; max-width:260px }
+#tip .t { color:var(--muted); margin-bottom:4px } #tip .r { display:flex; align-items:center; gap:8px; white-space:nowrap }
+#tip .k { width:10px; height:3px; border-radius:2px; flex:none } #tip b { font-variant-numeric:tabular-nums }
+.tag { color:var(--fg); background:var(--card); border:1px solid var(--line); display:inline-flex; align-items:center; gap:5px; padding:0 8px }
+.tag.ai, .tag.human, .tag.nodata { background:var(--card) }
+.tag::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--c) }
+.tag.ai { --c:var(--c-ai) } .tag.human { --c:var(--c-human) } .tag.nodata { --c:var(--c-nodata) }
+"""
+CHART_JS = r"""
+(function () {
+  var D = JSON.parse(document.getElementById('chart-data').textContent);
+  var NS = 'http://www.w3.org/2000/svg';
+  var SER = [['ai', 'AI-assisted', 'var(--c-ai)'], ['human', 'Not AI (PRs checked)', 'var(--c-human)'], ['nodata', 'No PR data', 'var(--c-nodata)']];
+  var MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  var tip = document.getElementById('tip');
+
+  function el(tag, attrs, parent) {
+    var n = document.createElementNS(NS, tag);
+    for (var k in attrs) { if (k === 'style') n.setAttribute('style', attrs[k]); else n.setAttribute(k, attrs[k]); }
+    if (parent) parent.appendChild(n);
+    return n;
+  }
+  function text(parent, x, y, str, anchor, cls) {
+    var t = el('text', { x: x, y: y, 'text-anchor': anchor || 'start' }, parent);
+    if (cls) t.setAttribute('class', cls);
+    t.textContent = str;
+    return t;
+  }
+  function monthLabel(m) { var p = m.split('-'); return MON[+p[1] - 1] + (p[1] === '01' || m === D.months[0].m ? ' ' + p[0].slice(2) : ''); }
+  function niceScale(v) {
+    if (v <= 0) return { max: 1, step: 1 };
+    var raw = v / 4, p = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / p;
+    var step = (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p;
+    return { max: Math.ceil(v / step) * step, step: step };
+  }
+  function fmtDays(x) { return x == null ? '–' : (x < 100 ? x.toFixed(1) : Math.round(x)) + ' d'; }
+
+  // tooltip: rows = [{key: cssColor|null, label, value}], all text via textContent
+  function showTip(evt, title, rows, anchorEl) {
+    tip.textContent = '';
+    var t = document.createElement('div'); t.className = 't'; t.textContent = title; tip.appendChild(t);
+    rows.forEach(function (r) {
+      var d = document.createElement('div'); d.className = 'r';
+      if (r.key) { var k = document.createElement('span'); k.className = 'k'; k.style.background = r.key; d.appendChild(k); }
+      var b = document.createElement('b'); b.textContent = r.value; d.appendChild(b);
+      var l = document.createElement('span'); l.textContent = r.label; l.style.color = 'var(--muted)'; d.appendChild(l);
+      tip.appendChild(d);
+    });
+    tip.style.display = 'block';
+    var x, y;
+    if (evt && evt.clientX != null) { x = evt.clientX; y = evt.clientY; }
+    else { var b2 = anchorEl.getBoundingClientRect(); x = b2.left + b2.width / 2; y = b2.top; }
+    var w = tip.offsetWidth, h = tip.offsetHeight;
+    tip.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, x + 14)) + 'px';
+    tip.style.top = Math.max(8, Math.min(window.innerHeight - h - 8, y - h - 10 < 8 ? y + 18 : y - h - 10)) + 'px';
+  }
+  function hideTip() { tip.style.display = 'none'; }
+  function wire(node, title, rows) {
+    node.setAttribute('tabindex', '0');
+    node.setAttribute('role', 'img');
+    node.setAttribute('aria-label', title + ': ' + rows.map(function (r) { return r.value + ' ' + r.label; }).join(', '));
+    node.addEventListener('pointermove', function (e) { showTip(e, title, rows, node); });
+    node.addEventListener('pointerleave', hideTip);
+    node.addEventListener('focus', function () { showTip(null, title, rows, node); });
+    node.addEventListener('blur', hideTip);
+  }
+  function topRounded(x, y, w, h, r) {
+    r = Math.max(0, Math.min(r, h, w / 2));
+    return 'M' + x + ',' + (y + h) + 'V' + (y + r) + 'Q' + x + ',' + y + ' ' + (x + r) + ',' + y + 'H' + (x + w - r) +
+      'Q' + (x + w) + ',' + y + ' ' + (x + w) + ',' + (y + r) + 'V' + (y + h) + 'Z';
+  }
+
+  // 1. Stacked columns: stories done per month by AI status
+  function columns(host) {
+    host.textContent = '';
+    var rows = D.months, n = rows.length, W = host.clientWidth || 600, H = 250;
+    var m = { l: 36, r: 44, t: 10, b: 26 }, pw = W - m.l - m.r, ph = H - m.t - m.b;
+    var sc = niceScale(Math.max.apply(null, rows.map(function (r) { return r.ai + r.human + r.nodata; })));
+    var svg = el('svg', { width: W, height: H, viewBox: '0 0 ' + W + ' ' + H }, host);
+    var y = function (v) { return m.t + ph - v / sc.max * ph; };
+    for (var v = 0; v <= sc.max + 1e-9; v += sc.step) {
+      el('line', { x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), style: 'stroke:' + (v === 0 ? 'var(--axis)' : 'var(--grid)') + ';stroke-width:1' }, svg);
+      text(svg, m.l - 6, y(v) + 4, String(Math.round(v)), 'end');
+    }
+    var band = pw / n, bw = Math.min(24, band * 0.62), every = Math.ceil(46 / band);
+    rows.forEach(function (r, i) {
+      var cx = m.l + band * (i + 0.5), x = cx - bw / 2, acc = 0, g = el('g', {}, svg);
+      var segs = SER.filter(function (s) { return r[s[0]] > 0; });
+      segs.forEach(function (s, j) {
+        var v0 = acc, v1 = acc + r[s[0]]; acc = v1;
+        var top = y(v1), bottom = y(v0), h = bottom - top - (j > 0 ? 2 : 0);   // 2px surface gap between segments
+        if (h <= 0) return;
+        var last = j === segs.length - 1;
+        el('path', { d: last ? topRounded(x, top, bw, h, 4) : 'M' + x + ',' + top + 'h' + bw + 'v' + h + 'h' + (-bw) + 'Z', style: 'fill:' + s[2] }, g);
+      });
+      if (i % every === 0) text(svg, cx, H - 8, monthLabel(r.m), 'middle');
+      var hit = el('rect', { class: 'hit', x: m.l + band * i, y: m.t, width: band, height: ph }, svg);
+      var rowsT = SER.map(function (s) { return { key: s[2], label: s[1], value: String(r[s[0]]) }; });
+      rowsT.push({ key: null, label: 'total done', value: String(r.ai + r.human + r.nodata) });
+      wire(hit, r.m, rowsT);
+      hit.addEventListener('pointerenter', function () { g.style.opacity = 0.8; });
+      hit.addEventListener('pointerleave', function () { g.style.opacity = 1; });
+      hit.addEventListener('focus', function () { g.style.opacity = 0.8; });
+      hit.addEventListener('blur', function () { g.style.opacity = 1; });
+    });
+  }
+
+  // 2. Line: share of AI-assisted stories among those with PR data
+  function line(host) {
+    host.textContent = '';
+    var rows = D.months, n = rows.length, W = host.clientWidth || 600, H = 210;
+    var m = { l: 36, r: 44, t: 12, b: 26 }, pw = W - m.l - m.r, ph = H - m.t - m.b;
+    var svg = el('svg', { width: W, height: H, viewBox: '0 0 ' + W + ' ' + H }, host);
+    var y = function (v) { return m.t + ph - v / 100 * ph; };
+    var band = pw / Math.max(1, n), X = function (i) { return m.l + band * (i + 0.5); };
+    [0, 25, 50, 75, 100].forEach(function (v) {
+      el('line', { x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), style: 'stroke:' + (v === 0 ? 'var(--axis)' : 'var(--grid)') + ';stroke-width:1' }, svg);
+      text(svg, m.l - 6, y(v) + 4, v + '%', 'end');
+    });
+    var every = Math.ceil(46 / band), d = '', pen = false;
+    rows.forEach(function (r, i) {
+      if (i % every === 0) text(svg, X(i), H - 8, monthLabel(r.m), 'middle');
+      if (r.pct == null) { pen = false; return; }
+      d += (pen ? 'L' : 'M') + X(i) + ',' + y(r.pct); pen = true;
+    });
+    el('path', { d: d, style: 'fill:none;stroke:var(--c-ai);stroke-width:2;stroke-linecap:round;stroke-linejoin:round' }, svg);
+    var cross = el('line', { y1: m.t, y2: m.t + ph, style: 'stroke:var(--axis);stroke-width:1;display:none' }, svg);
+    var lastI = -1;
+    rows.forEach(function (r, i) {
+      if (r.pct == null) return;
+      lastI = i;
+      el('circle', { cx: X(i), cy: y(r.pct), r: 4, style: 'fill:var(--c-ai);stroke:var(--surface);stroke-width:2' }, svg);
+    });
+    if (lastI >= 0) text(svg, X(lastI) + 9, y(rows[lastI].pct) + 4, rows[lastI].pct.toFixed(0) + '%', 'start', 'val');
+    rows.forEach(function (r, i) {
+      var hit = el('rect', { class: 'hit', x: m.l + band * i, y: m.t, width: band, height: ph }, svg);
+      var known = r.ai + r.human;
+      wire(hit, r.m, r.pct == null
+        ? [{ key: null, label: 'no stories with PR data', value: '–' }]
+        : [{ key: 'var(--c-ai)', label: 'AI-assisted', value: r.pct.toFixed(1) + '%' },
+           { key: null, label: 'of stories with PR data', value: r.ai + ' / ' + known }]);
+      var on = function () { cross.setAttribute('x1', X(i)); cross.setAttribute('x2', X(i)); cross.style.display = ''; };
+      var off = function () { cross.style.display = 'none'; };
+      hit.addEventListener('pointermove', on); hit.addEventListener('pointerleave', off);
+      hit.addEventListener('focus', on); hit.addEventListener('blur', off);
+    });
+  }
+
+  // 3. Grouped horizontal bars: median days per phase, AI vs not AI
+  function bars(host) {
+    host.textContent = '';
+    var W = host.clientWidth || 600, cats = [['created', 'Created'], ['committed', 'Committed'], ['lead', 'Lead time']];
+    var series = [['ai', 'AI-assisted', 'var(--c-ai)'], ['human', 'Not AI (PRs checked)', 'var(--c-human)']];
+    var bh = 16, gap = 2, group = bh * 2 + gap, gg = 22, m = { l: 84, r: 70, t: 4, b: 4 };
+    var H = m.t + m.b + cats.length * group + (cats.length - 1) * gg;
+    var max = 0;
+    cats.forEach(function (c) { series.forEach(function (s) { var v = D.phases[s[0]][c[0]]; if (v != null && v > max) max = v; }); });
+    var sc = niceScale(max || 1), pw = W - m.l - m.r;
+    var svg = el('svg', { width: W, height: H, viewBox: '0 0 ' + W + ' ' + H }, host);
+    cats.forEach(function (c, ci) {
+      var y0 = m.t + ci * (group + gg);
+      text(svg, m.l - 10, y0 + group / 2 + 4, c[1], 'end');
+      var tipRows = series.map(function (s) {
+        return { key: s[2], label: s[1] + ' (n=' + D.phases[s[0]].n + ')', value: fmtDays(D.phases[s[0]][c[0]]) };
+      });
+      series.forEach(function (s, si) {
+        var v = D.phases[s[0]][c[0]], y = y0 + si * (bh + gap);
+        if (v == null) return;
+        var w = Math.max(1, v / sc.max * pw), r = Math.min(4, w);
+        el('path', { d: 'M' + m.l + ',' + y + 'H' + (m.l + w - r) + 'Q' + (m.l + w) + ',' + y + ' ' + (m.l + w) + ',' + (y + r) +
+          'V' + (y + bh - r) + 'Q' + (m.l + w) + ',' + (y + bh) + ' ' + (m.l + w - r) + ',' + (y + bh) + 'H' + m.l + 'Z', style: 'fill:' + s[2] }, svg);
+        text(svg, m.l + w + 6, y + bh / 2 + 4, fmtDays(v), 'start', 'val');
+      });
+      var hit = el('rect', { class: 'hit', x: 0, y: y0 - gg / 2 + 2, width: W, height: group + gg - 4 }, svg);
+      wire(hit, 'Median days: ' + c[1], tipRows);
+    });
+    el('line', { x1: m.l, x2: m.l, y1: m.t, y2: H - m.b, style: 'stroke:var(--axis);stroke-width:1' }, svg);
+  }
+
+  var hosts = [[document.getElementById('c1'), columns], [document.getElementById('c2'), line], [document.getElementById('c3'), bars]];
+  function draw() { hosts.forEach(function (h) { if (h[0]) h[1](h[0]); }); }
+  draw();
+  if (window.ResizeObserver) { var t; new ResizeObserver(function () { clearTimeout(t); t = setTimeout(draw, 80); }).observe(document.querySelector('main')); }
+})();
+"""
+
+
+def chart_data(stories: list[Story]) -> dict:
+    months = sorted({s.done[:7] for s in stories})
+    if months:  # fill gaps so the time axis is continuous
+        y, m = map(int, months[0].split("-"))
+        ly, lm = map(int, months[-1].split("-"))
+        months = []
+        while (y, m) <= (ly, lm):
+            months.append(f"{y:04d}-{m:02d}")
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    rows = []
+    for mo in months:
+        g = [s for s in stories if s.done[:7] == mo]
+        ai, human = sum(s.ai == "ai" for s in g), sum(s.ai == "human" for s in g)
+        rows.append({"m": mo, "ai": ai, "human": human, "nodata": len(g) - ai - human,
+                     "pct": round(100.0 * ai / (ai + human), 2) if ai + human else None})
+    phases = {}
+    for k in ("ai", "human"):
+        g = [s for s in stories if s.ai == k]
+        r = lambda v: None if v is None else round(v, 2)
+        phases[k] = {"n": len(g), "created": r(med([s.phase_days["created"] for s in g])),
+                     "committed": r(med([s.phase_days["committed"] for s in g])), "lead": r(med([s.lead_days for s in g]))}
+    return {"months": rows, "phases": phases}
+
+
 LABEL = {"ai": "AI-assisted", "human": "Not AI (PRs checked)", "nodata": "No PR data"}
 
 
@@ -424,6 +651,8 @@ def render(org: str, project: str, wtype: str, stories: list[Story], states: lis
         return "".join(out)
 
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    plural = wtype[:-1] + "ies" if wtype.lower().endswith("y") else wtype + "s"
+    chart_json = json.dumps(chart_data(stories)).replace("</", "<\\/")
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Done stories · {esc(project)}</title>
@@ -445,10 +674,25 @@ th {{ font-size:12px; color:var(--muted); font-weight:600 }} td.num,th.num {{ te
 .tag {{ font-size:11px; padding:1px 7px; border-radius:99px; color:#fff }}
 .tag.ai {{ background:var(--ai) }} .tag.human {{ background:var(--human) }} .tag.nodata {{ background:var(--nodata) }}
 input {{ padding:6px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--fg); width:260px; max-width:100% }}
-</style></head><body><main>
-<h1>Done {esc(wtype)}s · {esc(project)}</h1>
+{CHART_CSS}</style></head><body><main>
+<h1>Done {esc(plural)} · {esc(project)}</h1>
 <div class="muted">{esc(org)} · done {"since " + str(since) if since else "all time"} · AI status from {pr_count:,} PRs in {esc(os.path.basename(prs_path)) or "n/a"} · generated {generated}</div>
 <div class="cards">{cards()}</div>
+
+<h2>Trends</h2>
+<div class="charts">
+  <section class="card chart"><h3>Stories done per month</h3><p class="muted">By whether a linked PR was AI-assisted</p>
+    <div class="legend"><span class="lk"><i style="background:var(--c-ai)"></i>AI-assisted</span><span class="lk"><i style="background:var(--c-human)"></i>Not AI (PRs checked)</span><span class="lk"><i style="background:var(--c-nodata)"></i>No PR data</span></div>
+    <div id="c1" class="host"></div></section>
+  <section class="card chart"><h3>Share of AI-assisted stories per month</h3><p class="muted">Of the stories done that month with a linked PR found in the PR report</p>
+    <div id="c2" class="host"></div></section>
+  <section class="card chart"><h3>Median days per phase</h3><p class="muted">AI-assisted vs not AI; stories without PR data are left out</p>
+    <div class="legend"><span class="lk"><i style="background:var(--c-ai)"></i>AI-assisted</span><span class="lk"><i style="background:var(--c-human)"></i>Not AI (PRs checked)</span></div>
+    <div id="c3" class="host"></div></section>
+</div>
+<p class="muted">Hover or focus a column, point or bar for its values. The same numbers are in the tables below.</p>
+<div id="tip" role="tooltip"></div>
+<script type="application/json" id="chart-data">{chart_json}</script>
 
 <h2>AI-assisted vs not (median days)</h2>
 <div class="wrap"><table><tr><th>Group</th><th class="num">Stories</th><th class="num">Share</th><th class="num">Created</th><th class="num">Committed</th><th class="num">Lead time</th><th class="num">Mean lead</th></tr>{cmp_rows()}</table></div>
@@ -471,7 +715,7 @@ document.getElementById('q').addEventListener('input', e => {{
   document.querySelectorAll('#t tr[data-q]').forEach(r => r.hidden = !r.dataset.q.includes(q));
 }});
 </script>
-</main></body></html>"""
+</main><script>{CHART_JS}</script></body></html>"""
 
 
 # --------------------------------------------------------------------------- #

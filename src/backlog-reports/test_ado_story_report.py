@@ -103,6 +103,26 @@ class LinkTests(unittest.TestCase):
                          ["https://gitlab.com/g/p/-/merge_requests/3", "vstfs:///GitHub/PullRequest/x%2f4"])
 
 
+class ChartDataTests(unittest.TestCase):
+    def story(self, done, ai, created=1.0, committed=2.0, lead=5.0):
+        s = a.Story(id=1, title="t", url="u", created="2026-01-01T00:00:00+00:00", done=done)
+        s.ai, s.phase_days, s.lead_days = ai, {"created": created, "committed": committed}, lead
+        return s
+
+    def test_months_are_continuous_and_share_ignores_no_data(self):
+        d = a.chart_data([self.story("2026-01-05T00:00:00+00:00", "ai"), self.story("2026-01-06T00:00:00+00:00", "human"),
+                          self.story("2026-01-07T00:00:00+00:00", "nodata"), self.story("2026-03-02T00:00:00+00:00", "nodata")])
+        self.assertEqual([r["m"] for r in d["months"]], ["2026-01", "2026-02", "2026-03"])
+        jan, feb, mar = d["months"]
+        self.assertEqual((jan["ai"], jan["human"], jan["nodata"], jan["pct"]), (1, 1, 1, 50.0))
+        self.assertEqual((feb["pct"], mar["pct"]), (None, None))   # nothing with PR data: a gap, not 0%
+        self.assertEqual(d["phases"]["ai"], {"n": 1, "created": 1.0, "committed": 2.0, "lead": 5.0})
+
+    def test_empty_group_has_no_medians(self):
+        d = a.chart_data([self.story("2026-01-05T00:00:00+00:00", "ai")])
+        self.assertEqual(d["phases"]["human"], {"n": 0, "created": None, "committed": None, "lead": None})
+
+
 class StatsTests(unittest.TestCase):
     def test_median_and_p90(self):
         self.assertEqual(a.med([1, 2, 10]), 2)
