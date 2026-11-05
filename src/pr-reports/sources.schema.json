@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Expecho/ai-adoption-tools/src/pr-reports/sources.schema.json",
+  "title": "ai_pr_report sources",
+  "description": "Selects which GitHub orgs / GitLab groups and repositories ai_pr_report.py scans. Wildcards: '*' matches within one path segment, '**' also across '/', '?' matches one character. Matching is case-insensitive and against the whole name.",
+  "type": "object",
+  "additionalProperties": false,
+  "anyOf": [{ "required": ["github"] }, { "required": ["gitlab"] }],
+  "properties": {
+    "$schema": { "type": "string" },
+    "since": {
+      "description": "Only PRs/MRs created on or after this date, or 'all'. Default: 12 months ago.",
+      "oneOf": [
+        { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        { "const": "all" }
+      ]
+    },
+    "github": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["orgs"],
+      "properties": {
+        "orgs": {
+          "description": "GitHub organizations to scan. Literal names are used as-is; wildcards are matched against the orgs you belong to.",
+          "$ref": "#/$defs/scopeFilter"
+        },
+        "repos": {
+          "description": "Repository filter. A pattern without '/' matches the bare repo name; with '/' it matches 'org/repo'.",
+          "$ref": "#/$defs/filter"
+        }
+      }
+    },
+    "gitlab": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["groups"],
+      "properties": {
+        "groups": {
+          "description": "GitLab group paths to scan (e.g. 'my-group' or 'my-group/sub'). Literal paths are used as-is; wildcards are matched against the groups you can access (needs a token that can list groups).",
+          "$ref": "#/$defs/scopeFilter"
+        },
+        "repos": {
+          "description": "Project filter. A pattern without '/' matches the bare project name; with '/' it matches the full path 'group/sub/project'.",
+          "$ref": "#/$defs/filter"
+        }
+      }
+    },
+    "options": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "includeArchived": { "type": "boolean", "default": false },
+        "includeForks": { "type": "boolean", "default": false, "description": "GitHub only." },
+        "includeBots": { "type": "boolean", "default": false },
+        "maxPrLines": { "type": "integer", "minimum": 0, "default": 10000 },
+        "heatmapMonths": { "type": "integer", "minimum": 1, "default": 12 },
+        "workers": { "type": "integer", "minimum": 1, "default": 4 }
+      }
+    }
+  },
+  "$defs": {
+    "patterns": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "pattern": "^\\S+$" }
+    },
+    "filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "include": {
+          "description": "Names or wildcards to process. Empty or missing means everything.",
+          "$ref": "#/$defs/patterns"
+        },
+        "exclude": {
+          "description": "Names or wildcards to skip. Exclude always wins over include.",
+          "$ref": "#/$defs/patterns"
+        }
+      }
+    },
+    "scopeFilter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["include"],
+      "properties": {
+        "include": { "allOf": [{ "$ref": "#/$defs/patterns" }, { "minItems": 1 }] },
+        "exclude": { "$ref": "#/$defs/patterns" }
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "$schema": "./sources.schema.json",
+  "since": "2026-01-01",
+  "github": {
+    "orgs": { "include": ["my-org", "my-other-org"] },
+    "repos": { "exclude": ["*-archive", "demo-*", "my-org/legacy-**"] }
+  },
+  "gitlab": {
+    "groups": { "include": ["my-group", "my-group/team-*"], "exclude": ["my-group/sandbox*"] },
+    "repos": { "include": ["app-*", "shared-lib"], "exclude": ["my-group/app-prototype"] }
+  },
+  "options": { "includeArchived": false, "includeForks": false, "includeBots": false }
+}

@@ -5,3 +5,7 @@ ai-prs.json
 run.log
 *.log
 __pycache__/
+
+# Local source selection (names your orgs/groups); copy sources.example.json to sources.json
+sources.json
+*.local.json

@@ -2,7 +2,7 @@
 """
 AI-assisted PR report for a GitHub organization or GitLab group.
 
-Scans every repository in an org, classifies each pull request (and each of its
+Scans every repository in the selected orgs/groups, classifies each pull request (and each of its
 commits) as AI-assisted or not, and writes a self-contained HTML report with:
   * AI-assisted PRs per repository
   * % of PRs that are AI-assisted, per month
@@ -17,13 +17,17 @@ GitHub (default) needs the GitHub CLI (`gh auth login`). GitLab (`--source gitla
 No other dependencies.
 
 Usage:
-    python ai_pr_report.py --org my-org                  # last 12 months
-    python ai_pr_report.py --source gitlab --org my-group   # a GitLab group (merge requests)
-    python ai_pr_report.py --org my-org --since 2026-01-01           # only PRs created since
-    python ai_pr_report.py --classify all              # classify purpose of every PR, not just AI ones
-    python ai_pr_report.py --since all                  # everything (slow: rate limits)
-    python ai_pr_report.py --repos RepoA RepoB          # subset of repos
-    python ai_pr_report.py --out report.html --json prs.json
+    python ai_pr_report.py --org my-org                       # one GitHub org, last 12 months
+    python ai_pr_report.py --source gitlab --org my-group     # one GitLab group (merge requests)
+    python ai_pr_report.py --config sources.json              # orgs/groups/repos chosen by a config file
+    python ai_pr_report.py --config sources.json --dry-run    # show what would be scanned, fetch nothing
+    python ai_pr_report.py --org my-org --since 2026-01-01    # only PRs created since
+    python ai_pr_report.py --org my-org --classify all        # classify purpose of every PR, not just AI ones
+    python ai_pr_report.py --org my-org --repos RepoA 'api-*' # subset of repos (names or wildcards)
+    python ai_pr_report.py --org my-org --out report.html --json prs.json
+
+A config file (see sources.example.json / sources.schema.json) can combine several GitHub orgs and
+GitLab groups in one report and filter orgs, groups and repositories by name or wildcard.
 """
 from __future__ import annotations
 
@@ -37,6 +41,7 @@ import hashlib
 import shutil
 import subprocess
 import tempfile
+import report_config as rc
 import os
 import sys
 import threading
@@ -114,6 +119,12 @@ class PR:
     body_excerpt: str = ""
     commit_subjects: list[str] = field(default_factory=list)
     category: str | None = None  # kind of work, set by classify_purposes() (headless Claude)
+    source: str = "github"       # "github" or "gitlab"
+
+    @property
+    def key(self) -> str:
+        """Unique repo key across platforms; `repo` is the full path (org/repo, group/sub/project)."""
+        return f"{self.source}:{self.repo}"
 
     @property
     def ai(self) -> bool:
@@ -124,7 +135,7 @@ def _match(rules: list[re.Pattern], text: str) -> bool:
     return any(r.search(text) for r in rules)
 
 
-def classify(node: dict, repo: str) -> PR:
+def classify(node: dict, repo: str, source: str = "github") -> PR:
     author = (node.get("author") or {}).get("login") or "ghost"
     branch = node.get("headRefName") or ""
     body = node.get("body") or ""
@@ -133,6 +144,7 @@ def classify(node: dict, repo: str) -> PR:
 
     pr = PR(
         repo=repo,
+        source=source,
         number=node["number"],
         title=node.get("title") or "",
         url=node["url"],
@@ -225,6 +237,11 @@ def list_repos(org: str, include_archived: bool, include_forks: bool) -> list[st
     )
 
 
+def discover_github_orgs() -> list[str]:
+    """Orgs the authenticated user belongs to; needed for wildcard org names."""
+    return [l.strip() for l in gh(["api", "--paginate", "user/orgs?per_page=100", "-q", ".[].login"]).splitlines() if l.strip()]
+
+
 PR_QUERY = """
 query($owner: String!, $name: String!, $cursor: String, $first: Int!) {
   repository(owner: $owner, name: $name) {
@@ -248,21 +265,35 @@ query($owner: String!, $name: String!, $cursor: String, $first: Int!) {
 """
 
 
-def fetch_prs(org: str, repo: str, since: dt.datetime | None, cache_dir: str | None, cache_hours: float) -> list[PR]:
+@dataclass(frozen=True)
+class Target:
+    source: str  # "github" | "gitlab"
+    scope: str   # org / group the repo was found through
+    path: str    # full path: org/repo or group/sub/project
+
+    @property
+    def key(self) -> str:
+        return f"{self.source}:{self.path}"
+
+
+def fetch_prs(t: Target, since: dt.datetime | None, cache_dir: str | None, cache_hours: float) -> list[PR]:
     since_key = f"{since:%Y-%m-%d}" if since else "all"
-    prefix = "" if SOURCE == "github" else f"{SOURCE}__"
-    fname = f"{prefix}{org}__{repo}__{since_key}.json".replace("/", "_")
-    path = os.path.join(cache_dir, fname) if cache_dir else None
+    prefix = "" if t.source == "github" else f"{t.source}__"
+    path = os.path.join(cache_dir, f"{prefix}{t.path.replace('/', '__')}__{since_key}.json") if cache_dir else None
     if path and os.path.exists(path) and time.time() - os.path.getmtime(path) < cache_hours * 3600:
         with open(path, encoding="utf-8") as f:
             nodes = json.load(f)
     else:
-        nodes = fetch_gitlab_nodes(org, repo) if SOURCE == "gitlab" else fetch_pr_nodes(org, repo, since)
+        if t.source == "gitlab":
+            nodes = fetch_gitlab_nodes(t.path)
+        else:
+            owner, name = t.path.split("/", 1)
+            nodes = fetch_pr_nodes(owner, name, since)
         if path:
             os.makedirs(cache_dir, exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(nodes, f)
-    return [classify(n, repo) for n in nodes]
+    return [classify(n, t.path, t.source) for n in nodes]
 
 
 def fetch_pr_nodes(org: str, repo: str, since: dt.datetime | None) -> list[dict]:
@@ -301,9 +332,8 @@ def fetch_pr_nodes(org: str, repo: str, since: dt.datetime | None) -> list[dict]
 # GitLab access via glab CLI (merge requests are normalised to the GitHub node shape)
 # --------------------------------------------------------------------------- #
 
-SOURCE = "github"  # set from --source
 WEB_BASE = {"github": "https://github.com", "gitlab": "https://gitlab.com"}
-_gl_projects: dict[str, list[dict]] = {}  # project path (relative to the group) -> merge requests
+_gl_projects: dict[str, dict[int, dict]] = {}  # full project path -> {MR id: MR}
 
 
 def glab(args: list[str], retries: int = 6) -> str:
@@ -331,19 +361,25 @@ def _json_values(text: str) -> list:
         out.extend(obj) if isinstance(obj, list) else out.append(obj)
 
 
+def discover_gitlab_groups() -> list[str]:
+    """Full paths of all groups (and subgroups) the token can see; needed for wildcard group names."""
+    return [g["full_path"] for g in _json_values(glab(["api", "--paginate", "groups?per_page=100&min_access_level=10"]))]
+
+
 def load_gitlab_group(group: str, since: dt.datetime | None, include_archived: bool) -> list[str]:
-    """List the group's merge requests in one call; this also tells us which projects have any."""
+    """List a group's merge requests in one call; this also tells us which projects have any.
+
+    Returns the full project paths. Projects reached through several groups are kept once."""
     query = (f"groups/{quote(group, safe='')}/merge_requests?per_page=100&state=all&scope=all"
              f"&order_by=created_at&sort=desc&non_archived={'false' if include_archived else 'true'}")
     if since:
         query += f"&created_after={since:%Y-%m-%dT%H:%M:%SZ}"
-    prefix = group.lower() + "/"
-    _gl_projects.clear()
+    paths: dict[str, None] = {}
     for mr in _json_values(glab(["api", "--paginate", query])):
         full = mr["references"]["full"].rsplit("!", 1)[0]
-        rel = full[len(prefix):] if full.lower().startswith(prefix) else full
-        _gl_projects.setdefault(rel, []).append(mr)
-    return sorted(_gl_projects, key=str.lower)
+        _gl_projects.setdefault(full, {})[mr["id"]] = mr
+        paths[full] = None
+    return sorted(paths, key=str.lower)
 
 
 def _gitlab_commit(project_id: int, c: dict) -> dict:
@@ -382,8 +418,8 @@ def _gitlab_node(mr: dict) -> dict:
     }
 
 
-def fetch_gitlab_nodes(group: str, project: str) -> list[dict]:
-    return [_gitlab_node(mr) for mr in _gl_projects.get(project, [])]
+def fetch_gitlab_nodes(project_path: str) -> list[dict]:
+    return [_gitlab_node(mr) for mr in _gl_projects.get(project_path, {}).values()]
 
 
 # --------------------------------------------------------------------------- #
@@ -457,7 +493,8 @@ def classify_purposes(prs: list[PR], mode: str, model: str, cache_dir: str | Non
     if mode == "none":
         return
     targets = [p for p in prs if mode == "all" or p.ai]
-    key = lambda p: f"{p.repo}#{p.number}"
+    key = lambda p: f"{p.key}#{p.number}"
+    legacy = lambda p: f"{p.repo.rsplit('/', 1)[-1]}#{p.number}"  # keys written before multi-source support
     fingerprint = lambda p: hashlib.sha1(
         f"{CLASSIFY_VERSION}|{model}|{p.title}|{p.body_excerpt}|{p.commit_subjects}".encode()).hexdigest()[:16]
 
@@ -468,7 +505,7 @@ def classify_purposes(prs: list[PR], mode: str, model: str, cache_dir: str | Non
             cache = json.load(f)
     todo = []
     for p in targets:
-        hit = cache.get(key(p))
+        hit = cache.get(key(p)) or (cache.get(legacy(p)) if p.source == "github" else None)
         if hit and hit.get("fp") == fingerprint(p):
             p.category = hit["category"]
         else:
@@ -728,7 +765,15 @@ def render_html(org: str, prs: list[PR], repos: list[str], since: dt.datetime | 
                 errors: dict[str, str], heat_months: int, max_pr_lines: int, include_bots: bool = False) -> str:
     by_repo: dict[str, list[PR]] = defaultdict(list)
     for p in prs:
-        by_repo[p.repo].append(p)
+        by_repo[p.key].append(p)
+    # Repo keys are "source:path". Show the bare name when the report covers a single org/group.
+    paths = {k: k.split(":", 1)[1] for k in repos}
+    sources = {k.split(":", 1)[0] for k in repos}
+    single_scope = len(sources) == 1 and len({v.rsplit("/", 1)[0] for v in paths.values()}) == 1
+    label = {k: (v.rsplit("/", 1)[-1] if single_scope else v) for k, v in paths.items()}
+    platform_name = {"github": "GitHub", "gitlab": "GitLab"}
+    repo_url = lambda k: f"{WEB_BASE[k.split(':', 1)[0]]}/{paths[k]}"
+    badge = lambda k: (f' <span class="muted">· {platform_name[k.split(":", 1)[0]]}</span>' if len(sources) > 1 else "")
 
     tool_totals = Counter(t for p in prs for t in p.tools)
     purpose_table, purpose_chart = render_purpose(prs, max_pr_lines)
@@ -765,7 +810,7 @@ def render_html(org: str, prs: list[PR], repos: list[str], since: dt.datetime | 
         if not any(rm.get(m, Bucket()).prs for m in hm_months):
             continue
         cells = "".join(heat_cell(rm[m].pr_pct() if m in rm else None, rm[m].prs if m in rm else 0) for m in hm_months)
-        hm_rows.append(f'<tr><th class="rh">{esc(r)}</th>{cells}</tr>')
+        hm_rows.append(f'<tr><th class="rh">{esc(label[r])}</th>{cells}</tr>')
     hm_head = "".join(f'<th class="mh">{m[2:]}</th>' for m in hm_months)
 
     # Repo rows
@@ -809,9 +854,9 @@ def render_html(org: str, prs: list[PR], repos: list[str], since: dt.datetime | 
         err = f' <span class="err" title="{esc(errors[r])}">⚠ fetch failed</span>' if r in errors else ""
         code_pct = pct(ral, rl)
         rows.append(
-            f'<tr class="repo{" has-ai" if a else ""}" data-repo="{esc(r.lower())}" data-total="{n}" data-ai="{a}" '
+            f'<tr class="repo{" has-ai" if a else ""}" data-repo="{esc(label[r].lower())}" data-total="{n}" data-ai="{a}" '
             f'data-pct="{pct(a, n):.4f}" data-code="{code_pct:.4f}">'
-            f'<td><span class="caret">{"▸" if a else ""}</span><a href="{WEB_BASE[SOURCE]}/{esc(org)}/{esc(r)}" target="_blank" rel="noopener">{esc(r)}</a>{err}</td>'
+            f'<td><span class="caret">{"▸" if a else ""}</span><a href="{esc(repo_url(r))}" target="_blank" rel="noopener">{esc(label[r])}</a>{badge(r)}{err}</td>'
             f'<td class="num">{a}</td><td class="num">{n}</td><td class="num">{pct(a, n):.1f}%</td>'
             f'<td class="num" title="{ral:,} of {rl:,} lines added">{fmt_pct(code_pct if rl else None)}</td>'
             f'<td><div class="stack">{stack}</div><div class="chips">{chips}</div></td><td>{uses}</td></tr>{details}'
@@ -976,73 +1021,136 @@ document.getElementById('onlyAi').addEventListener('change', filter);
 # Main
 # --------------------------------------------------------------------------- #
 
+def resolve_scopes(flt: rc.Filter, discover, what: str) -> list[str]:
+    """Literal names are used as-is; wildcards are matched against what the account can see."""
+    names = list(flt.literals())
+    if flt.wildcards():
+        try:
+            found = discover()
+        except RuntimeError as e:
+            raise SystemExit(f"Cannot expand wildcard {what} {flt.wildcards()}: {e}\n"
+                             f"Use literal names, or a token that can list {what}s.")
+        names += [n for n in found if any(rc.compile_glob(w).fullmatch(n) for w in flt.wildcards())]
+    seen: dict[str, str] = {}
+    for n in names:
+        if flt.allows(n):
+            seen.setdefault(n.lower(), n)
+    return list(seen.values())
+
+
+def resolve_targets(cfg: rc.Config, since: dt.datetime | None, include_archived: bool, include_forks: bool) -> list[Target]:
+    targets: dict[tuple[str, str], Target] = {}
+    if cfg.github:
+        for org in resolve_scopes(cfg.github.scopes, discover_github_orgs, "org"):
+            for name in list_repos(org, include_archived, include_forks):
+                path = f"{org}/{name}"
+                if cfg.github.repos.allows(path):
+                    targets.setdefault(("github", path.lower()), Target("github", org, path))
+    if cfg.gitlab:
+        for group in resolve_scopes(cfg.gitlab.scopes, discover_gitlab_groups, "group"):
+            for path in load_gitlab_group(group, since, include_archived):
+                if cfg.gitlab.repos.allows(path):
+                    targets.setdefault(("gitlab", path.lower()), Target("gitlab", group, path))
+    return sorted(targets.values(), key=lambda t: (t.source, t.path.lower()))
+
+
+def report_unused_patterns(cfg: rc.Config) -> None:
+    for platform in cfg.platforms():
+        sc = getattr(cfg, platform)
+        for what, flt in (("orgs" if platform == "github" else "groups", sc.scopes), ("repos", sc.repos)):
+            for pat in flt.unused():
+                print(f"  note: {platform}.{what} pattern '{pat}' matched nothing", file=sys.stderr)
+
+
 def main() -> int:
     try:
         sys.stderr.reconfigure(encoding="utf-8")
     except Exception:
         pass
-    ap = argparse.ArgumentParser(description="Report AI-assisted PRs per repository of a GitHub org or GitLab group.")
-    ap.add_argument("--source", choices=["github", "gitlab"], default="github",
-                    help="Where to read from (default github). For gitlab, merge requests are treated as PRs")
-    ap.add_argument("--org", required=True, help="GitHub organization, or GitLab group path (e.g. my-group/sub)")
+    ap = argparse.ArgumentParser(description="Report AI-assisted PRs per repository of GitHub orgs and GitLab groups.")
+    ap.add_argument("--config", help="JSON file selecting orgs/groups/repos (see sources.example.json)")
+    ap.add_argument("--source", choices=["github", "gitlab"], default=None,
+                    help="Limit the run to one platform (default: all platforms in the config, github with --org)")
+    ap.add_argument("--org", default=None, help="GitHub organization, or GitLab group path with --source gitlab "
+                                                "(replaces that platform's orgs/groups from the config)")
     ap.add_argument("--since", default=None,
                     help="Only PRs created on/after this date (YYYY-MM-DD), or 'all'. Default: 12 months ago")
     ap.add_argument("--cache-dir", default=".cache", help="Per-repo cache of fetched PRs (default .cache; '' disables)")
     ap.add_argument("--cache-hours", type=float, default=12, help="Reuse cached repo data younger than this (default 12)")
-    ap.add_argument("--repos", nargs="*", help="Limit to these repositories")
-    ap.add_argument("--include-archived", action="store_true")
-    ap.add_argument("--include-forks", action="store_true")
-    ap.add_argument("--include-bots", action="store_true",
+    ap.add_argument("--repos", nargs="*", help="Limit to these repositories (names or wildcards; replaces the config's repo include list)")
+    ap.add_argument("--include-archived", action="store_true", default=None)
+    ap.add_argument("--include-forks", action="store_true", default=None)
+    ap.add_argument("--include-bots", action="store_true", default=None,
                     help="Keep PRs opened by automation bots such as Dependabot/Renovate (excluded by default)")
-    ap.add_argument("--max-pr-lines", type=int, default=10000,
+    ap.add_argument("--max-pr-lines", type=int, default=None,
                     help="Leave merged PRs adding more lines than this out of the code share (default 10000; 0 = no limit)")
-    ap.add_argument("--heatmap-months", type=int, default=12, help="Months shown in the repo heatmap (default 12)")
-    ap.add_argument("--workers", type=int, default=4, help="Parallel repo fetches / claude calls (default 4)")
+    ap.add_argument("--heatmap-months", type=int, default=None, help="Months shown in the repo heatmap (default 12)")
+    ap.add_argument("--workers", type=int, default=None, help="Parallel repo fetches / claude calls (default 4)")
     ap.add_argument("--classify", choices=["ai", "all", "none"], default="ai",
                     help="Classify PR purpose with headless Claude: AI-assisted PRs only (default), all PRs "
                          "(adds a comparison with non-AI PRs), or none")
     ap.add_argument("--classify-model", default="haiku", help="Model for classification (default haiku)")
+    ap.add_argument("--dry-run", action="store_true", help="Resolve and list the repos that would be scanned, then stop")
     ap.add_argument("--out", default="ai-prs.html", help="HTML output path (default ai-prs.html)")
     ap.add_argument("--json", help="Also write the classified PR data to this JSON file")
     args = ap.parse_args()
 
-    if args.since is None:
+    try:
+        cfg = rc.apply_cli(rc.load(args.config) if args.config else None, args.source, args.org, args.repos)
+    except rc.ConfigError as e:
+        ap.error(str(e))
+    opt = lambda cli, name, default: cli if cli is not None else cfg.options.get(name, default)
+    include_archived = opt(args.include_archived, "includeArchived", False)
+    include_forks = opt(args.include_forks, "includeForks", False)
+    include_bots = opt(args.include_bots, "includeBots", False)
+    max_pr_lines = opt(args.max_pr_lines, "maxPrLines", 10000)
+    heatmap_months = opt(args.heatmap_months, "heatmapMonths", 12)
+    workers = opt(args.workers, "workers", 4)
+
+    since_arg = args.since or cfg.since
+    if since_arg is None:
         today = dt.date.today()
-        args.since = f"{today.year - 1:04d}-{today.month:02d}-01"
-    since = None if args.since == "all" else dt.datetime.fromisoformat(args.since).replace(tzinfo=dt.timezone.utc)
-    global SOURCE
-    SOURCE = args.source
-    if SOURCE == "gitlab":
-        repos = load_gitlab_group(args.org, since, args.include_archived)
-        if args.repos:
-            repos = [r for r in repos if r in args.repos or r.rsplit("/", 1)[-1] in args.repos]
-    else:
-        repos = args.repos or list_repos(args.org, args.include_archived, args.include_forks)
-    print(f"Scanning {len(repos)} repositories in {args.org}...", file=sys.stderr)
+        since_arg = f"{today.year - 1:04d}-{today.month:02d}-01"
+    since = None if since_arg == "all" else dt.datetime.fromisoformat(since_arg).replace(tzinfo=dt.timezone.utc)
+
+    targets = resolve_targets(cfg, since, include_archived, include_forks)
+    report_unused_patterns(cfg)
+    scopes = sorted({f"{t.scope}" for t in targets}, key=str.lower)
+    title = ", ".join(scopes) or "no repositories"
+    by_source = Counter(t.source for t in targets)
+    print(f"Selected {len(targets)} repositories ({', '.join(f'{n} {s}' for s, n in by_source.items()) or 'none'}) "
+          f"in {title}", file=sys.stderr)
+    if args.dry_run:
+        for t in targets:
+            print(f"{t.source:7} {t.path}")
+        return 0
+    if not targets:
+        print("Nothing to scan: no repositories match the filters.", file=sys.stderr)
+        return 1
 
     prs: list[PR] = []
     errors: dict[str, str] = {}
-    with cf.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futs = {pool.submit(fetch_prs, args.org, r, since, args.cache_dir or None, args.cache_hours): r for r in repos}
+    with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(fetch_prs, t, since, args.cache_dir or None, args.cache_hours): t for t in targets}
         for i, fut in enumerate(cf.as_completed(futs), 1):
-            r = futs[fut]
+            t = futs[fut]
             try:
                 got = fut.result()
                 prs.extend(got)
-                print(f"  [{i}/{len(repos)}] {r}: {sum(p.ai for p in got)}/{len(got)} AI-assisted", file=sys.stderr)
+                print(f"  [{i}/{len(targets)}] {t.path}: {sum(p.ai for p in got)}/{len(got)} AI-assisted", file=sys.stderr)
             except Exception as e:  # keep going; the failure is shown in the HTML
-                errors[r] = str(e)
-                print(f"  [{i}/{len(repos)}] {r}: ERROR {e}", file=sys.stderr)
+                errors[t.key] = str(e)
+                print(f"  [{i}/{len(targets)}] {t.path}: ERROR {e}", file=sys.stderr)
 
-    if not args.include_bots:
+    if not include_bots:
         before = len(prs)
         prs = [p for p in prs if p.ai or not NON_AI_BOT_RE.search(p.author)]
         print(f"Excluded {before - len(prs)} PRs opened by automation bots (use --include-bots to keep them)", file=sys.stderr)
     for p in prs:
-        p.outlier = bool(args.max_pr_lines) and p.lines_added > args.max_pr_lines
-    classify_purposes(prs, args.classify, args.classify_model, args.cache_dir or None, args.workers)
+        p.outlier = bool(max_pr_lines) and p.lines_added > max_pr_lines
+    classify_purposes(prs, args.classify, args.classify_model, args.cache_dir or None, workers)
     with open(args.out, "w", encoding="utf-8") as f:
-        f.write(render_html(args.org, prs, repos, since, errors, args.heatmap_months, args.max_pr_lines, args.include_bots))
+        f.write(render_html(title, prs, [t.key for t in targets], since, errors, heatmap_months, max_pr_lines, include_bots))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump([asdict(p) | {"ai": p.ai} for p in prs], f, indent=2)

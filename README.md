@@ -5,7 +5,11 @@ Small tools for measuring how much AI coding assistance is used in a software or
 ## Contents
 
 ```
-src/pr-reports/ai_pr_report.py   AI-assisted pull request report for a GitHub organisation
+src/pr-reports/ai_pr_report.py      AI-assisted PR/MR report for GitHub orgs and GitLab groups
+src/pr-reports/report_config.py     source filters (wildcards) and config validation
+src/pr-reports/sources.schema.json  JSON Schema for the config file
+src/pr-reports/sources.example.json example config (copy to sources.json, which is git-ignored)
+src/pr-reports/test_report_config.py unit tests (python -m unittest, run from src/pr-reports)
 ```
 
 ### `ai_pr_report.py`
@@ -30,15 +34,45 @@ Detected tools: Claude (Claude Code), GitHub Copilot and Cursor. Detection is ba
 #### Usage
 
 ```sh
-python src/pr-reports/ai_pr_report.py --org my-org                    # last 12 months
+python src/pr-reports/ai_pr_report.py --org my-org                       # one GitHub org, last 12 months
+python src/pr-reports/ai_pr_report.py --source gitlab --org my-group     # one GitLab group
+python src/pr-reports/ai_pr_report.py --config sources.json              # orgs, groups and repos from a config file
+python src/pr-reports/ai_pr_report.py --config sources.json --dry-run    # list what would be scanned, fetch nothing
 python src/pr-reports/ai_pr_report.py --org my-org --since 2026-01-01
-python src/pr-reports/ai_pr_report.py --source gitlab --org my-group  # GitLab group (subgroups: my-group/sub)
-python src/pr-reports/ai_pr_report.py --org my-org --classify all     # classify every PR, not just AI ones
-python src/pr-reports/ai_pr_report.py --org my-org --repos RepoA RepoB
+python src/pr-reports/ai_pr_report.py --org my-org --classify all        # classify every PR, not just AI ones
+python src/pr-reports/ai_pr_report.py --org my-org --repos RepoA 'api-*'
 python src/pr-reports/ai_pr_report.py --org my-org --out report.html --json prs.json
 ```
 
-On GitLab, merge requests are treated as PRs and the group's projects are discovered from its merge requests. Run `--help` for all options. Fetched data is cached per repository in `.cache/` (12 hours by default).
+On GitLab, merge requests are treated as PRs. Run `--help` for all options. Fetched data is cached per repository in `.cache/` (12 hours by default).
+
+#### Choosing what is scanned (config file)
+
+A config file selects GitHub orgs, GitLab groups and repositories, and combines them in one report. Copy `sources.example.json` to `sources.json` (git-ignored, so your org and group names stay private) and pass it with `--config`. The `$schema` key gives autocompletion in editors.
+
+```json
+{
+  "$schema": "./sources.schema.json",
+  "since": "2026-01-01",
+  "github": {
+    "orgs":  { "include": ["my-org"] },
+    "repos": { "exclude": ["*-archive", "demo-*"] }
+  },
+  "gitlab": {
+    "groups": { "include": ["my-group", "my-group/team-*"], "exclude": ["my-group/sandbox*"] },
+    "repos":  { "include": ["app-*", "shared-lib"], "exclude": ["my-group/app-prototype"] }
+  },
+  "options": { "includeArchived": false, "includeBots": false }
+}
+```
+
+- `github.orgs` / `gitlab.groups` choose where to look and need at least one `include`. `repos` filters the repositories found there.
+- Every filter is a pair of arrays, `include` and `exclude`, of names or wildcards. A name is processed if it matches an `include` pattern (an empty `include` means everything) and no `exclude` pattern, so `exclude` always wins.
+- Wildcards: `*` matches within one path segment, `**` also across `/`, `?` matches one character. Matching is case-insensitive and against the whole name.
+- Repo patterns without a `/` match the bare repository name in any org or group. Patterns with a `/` match the full path (`org/repo`, `group/sub/project`).
+- Literal org and group names are used as-is. Wildcard names are matched against the orgs you belong to (GitHub) or the groups your token can list (GitLab, which needs a token that can read groups).
+- Patterns that match nothing are reported on stderr, which usually means a typo.
+- Command-line flags override the config: `--source` limits the run to one platform, `--org` replaces that platform's orgs/groups, `--repos` replaces the repo include list, and `--since` and the `--include-*` flags win over the config's `since` and `options`.
 
 #### Privacy
 
