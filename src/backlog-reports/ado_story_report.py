@@ -18,6 +18,7 @@ personal access token in the ADO_PAT environment variable. No other dependencies
 Usage:
     python ado_story_report.py                                  # org/project from `az devops configure`
     python ado_story_report.py --org ibissoftware --project Ibis --since 2026-01-01
+    python ado_story_report.py --config stories.json            # restrict to areas / created date / stories with tasks
     python ado_story_report.py --prs ../pr-reports/ai-prs.json --out ai-stories.html --json ai-stories.json
 """
 from __future__ import annotations
@@ -38,6 +39,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import story_config
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 
@@ -292,12 +294,14 @@ def build_story(wi: dict, events: list[tuple[dt.datetime, str]], org_url: str, c
 # Fetching
 # --------------------------------------------------------------------------- #
 
-def query_ids(ado: Ado, project: str, wtype: str, since: dt.date | None) -> list[int]:
+def query_ids(ado: Ado, project: str, wtype: str, since: dt.date | None, created_since: str | None = None) -> list[int]:
     esc = lambda s: s.replace("'", "''")
     where = (f"[System.TeamProject] = '{esc(project)}' AND [System.WorkItemType] = '{esc(wtype)}' "
              f"AND [System.State] = 'Done'")
     if since:
         where += f" AND [Microsoft.VSTS.Common.StateChangeDate] >= '{since:%Y-%m-%d}'"
+    if created_since:
+        where += f" AND [System.CreatedDate] >= '{created_since}'"
     res = ado.request(f"{urllib.parse.quote(project)}/_apis/wit/wiql", {"query": f"SELECT [System.Id] FROM WorkItems WHERE {where} ORDER BY [System.Id]"})
     return [w["id"] for w in res.get("workItems", [])]
 
@@ -675,7 +679,7 @@ LABEL = {"ai": "AI-assisted", "human": "Not AI (PRs checked)", "nodata": "No PR 
 
 
 def render(org: str, project: str, wtype: str, stories: list[Story], states: list[str], since: dt.date | None,
-           prs_path: str, pr_count: int) -> str:
+           prs_path: str, pr_count: int, filter_note: str = "") -> str:
     total = len(stories)
     by = {k: [s for s in stories if s.ai == k] for k in LABEL}
     known = len(by["ai"]) + len(by["human"])
@@ -791,7 +795,7 @@ th {{ font-size:12px; color:var(--muted); font-weight:600 }} td.num,th.num {{ te
 input {{ padding:6px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--fg); width:260px; max-width:100% }}
 {CHART_CSS}</style></head><body><main>
 <h1>Done {esc(plural)} · {esc(project)}</h1>
-<div class="muted">{esc(org)} · done {"since " + str(since) if since else "all time"} · AI status from {pr_count:,} PRs in {esc(os.path.basename(prs_path)) or "n/a"} · generated {generated}</div>
+<div class="muted">{esc(org)} · done {"since " + str(since) if since else "all time"}{" · " + esc(filter_note) if filter_note else ""} · AI status from {pr_count:,} PRs in {esc(os.path.basename(prs_path)) or "n/a"} · generated {generated}</div>
 <div class="cards">{cards()}</div>
 
 <h2>Trends</h2>
@@ -860,6 +864,8 @@ def main() -> int:
     ap.add_argument("--tenant", default=None, help="Entra tenant id that backs the organization (default: detected from your az login)")
     ap.add_argument("--type", default="User Story", help="Work item type (default 'User Story')")
     ap.add_argument("--since", default=None, help="Only stories done on/after this date (YYYY-MM-DD), or 'all'. Default: 12 months ago")
+    ap.add_argument("--config", help="JSON file narrowing which stories are used (areaPaths, createdSince, requireTasks); see stories.example.json")
+    ap.add_argument("--created-since", default=None, help="Only stories created on/after this date (YYYY-MM-DD); overrides the config")
     ap.add_argument("--prs", default=os.path.join(HERE, "..", "pr-reports", "ai-prs.json"),
                     help="JSON written by ai_pr_report.py --json, used to decide which PRs are AI-assisted")
     ap.add_argument("--cache-dir", default=".cache", help="Cache of state histories (default .cache; '' disables)")
@@ -876,9 +882,16 @@ def main() -> int:
         args.since = f"{today.year - 1:04d}-{today.month:02d}-01"
     since = None if args.since == "all" else dt.date.fromisoformat(args.since)
 
+    try:
+        scfg = story_config.load(args.config) if args.config else story_config.StoryConfig()
+        if args.created_since:
+            scfg.created_since = story_config.parse_date(args.created_since, "--created-since")
+    except story_config.ConfigError as e:
+        ap.error(str(e))
+
     ado = Ado(args.org, args.tenant)
     org_url = ado.base
-    ids = query_ids(ado, args.project, args.type, since)
+    ids = query_ids(ado, args.project, args.type, since, scfg.created_since)
     if args.limit:
         ids = ids[-args.limit:]
     print(f"{len(ids)} {args.type} work items in state Done since {args.since} in {args.org}/{args.project}", file=sys.stderr)
@@ -888,6 +901,14 @@ def main() -> int:
     cats_raw = ado.request(f"{urllib.parse.quote(args.project)}/_apis/wit/workitemtypes/{urllib.parse.quote(args.type)}/states").get("value", [])
     categories = {s["name"]: s.get("category") or "" for s in cats_raw}
     items = fetch_items(ado, ids)
+    if scfg.areas.active() or scfg.require_tasks:
+        before = len(items)
+        items = story_config.select(items, scfg)
+        print(f"Story selection kept {len(items)} of {before} ({scfg.describe()})", file=sys.stderr)
+        for p in scfg.areas.unused():
+            print(f"  warning: area pattern '{p}' matched no story (typo?)", file=sys.stderr)
+        if not items:
+            return 1
     descendants = fetch_descendants(ado, items)
     print(f"Fetched {len(items)} work items and {sum(len(v) for v in descendants.values())} child items; reading state history...", file=sys.stderr)
 
@@ -940,7 +961,7 @@ def main() -> int:
 
     states = [n for n, c in sorted(categories.items(), key=lambda kv: list(categories).index(kv[0])) if n != "Done" and c != "Removed"]
     with open(args.out, "w", encoding="utf-8") as f:
-        f.write(render(args.org, args.project, args.type, stories, states, since, args.prs, len(prs)))
+        f.write(render(args.org, args.project, args.type, stories, states, since, args.prs, len(prs), scfg.describe()))
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump([asdict(s) for s in stories], f, indent=2)

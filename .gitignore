@@ -11,3 +11,6 @@ sources.json
 *.local.json
 ai-stories.html
 ai-stories.json
+
+# Local story selection (names your area paths); copy src/backlog-reports/stories.example.json
+/src/backlog-reports/stories.json

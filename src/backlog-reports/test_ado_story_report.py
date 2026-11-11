@@ -2,6 +2,7 @@ import datetime as dt
 import unittest
 
 import ado_story_report as a
+import story_config as sc
 
 UTC = dt.timezone.utc
 
@@ -187,6 +188,48 @@ class DescendantTests(unittest.TestCase):
         items = {2: {"id": 2, "relations": [rel_child(3)]}, 3: {"id": 3, "relations": [rel_child(4)]}, 4: {"id": 4, "relations": []}}
         d = a.fetch_descendants(FakeAdo(items), [story], depth=2)
         self.assertEqual(sorted(w["id"] for w in d[1]), [2, 3])
+
+
+class StoryConfigTests(unittest.TestCase):
+    def wi(self, i, area, children=False):
+        return {"id": i, "fields": {"System.AreaPath": area},
+                "relations": [rel_child(99)] if children else []}
+
+    def ids(self, items, data):
+        return [w["id"] for w in sc.select(items, sc.parse(data))]
+
+    def test_area_include_exclude_matches_area_and_below_case_insensitively(self):
+        items = [self.wi(1, "Ibis\Infra"), self.wi(2, "Ibis\Infra\Ops"), self.wi(3, "Ibis\Cloud"), self.wi(4, "Ibis\InfraX")]
+        self.assertEqual(self.ids(items, {"areaPaths": {"include": ["ibis\infra"]}}), [1, 2])
+        self.assertEqual(self.ids(items, {"areaPaths": {"include": ["Ibis\*"], "exclude": ["Ibis\Infra\Ops", "Ibis\Cloud"]}}), [1, 4])
+        self.assertEqual(self.ids(items, {"areaPaths": {"exclude": ["Ibis\Cloud"]}}), [1, 2, 4])
+
+    def test_single_star_stays_within_one_level(self):
+        items = [self.wi(1, "P\A\C"), self.wi(2, "P\A\B\C")]
+        self.assertEqual(self.ids(items, {"areaPaths": {"include": ["P\*\C"]}}), [1])
+        self.assertEqual(self.ids(items, {"areaPaths": {"include": ["P\**\C"]}}), [1, 2])
+
+    def test_require_tasks(self):
+        items = [self.wi(1, "A", children=True), self.wi(2, "A")]
+        self.assertEqual(self.ids(items, {"requireTasks": True}), [1])
+        self.assertEqual(self.ids(items, {}), [1, 2])
+
+    def test_unused_patterns_are_reported(self):
+        cfg = sc.parse({"areaPaths": {"include": ["A"], "exclude": ["Typo"]}})
+        sc.select([self.wi(1, "A")], cfg)
+        self.assertEqual(cfg.areas.unused(), ["Typo"])
+
+    def test_validation(self):
+        for bad in ({"since": "2026-01-01"}, {"createdSince": "01-01-2026"}, {"requireTasks": "yes"},
+                    {"areaPaths": []}, {"areaPaths": {"include": "A"}}, {"areaPaths": {"nope": []}},
+                    {"areaPaths": {"include": ["A", "a"]}}):
+            with self.assertRaises(sc.ConfigError, msg=bad):
+                sc.parse(bad)
+        self.assertEqual(sc.parse({"createdSince": "2025-01-01"}).created_since, "2025-01-01")
+
+    def test_describe(self):
+        cfg = sc.parse({"areaPaths": {"exclude": ["X"]}, "createdSince": "2025-01-01", "requireTasks": True})
+        self.assertEqual(cfg.describe(), "excluding areas X; created since 2025-01-01; with child tasks only")
 
 
 class StatsTests(unittest.TestCase):

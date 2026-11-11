@@ -1,0 +1,9 @@
+{
+  "$schema": "./stories.schema.json",
+  "areaPaths": {
+    "include": ["MyProject\\Team A", "MyProject\\Team B*"],
+    "exclude": ["MyProject\\Team A\\Operations"]
+  },
+  "createdSince": "2025-01-01",
+  "requireTasks": true
+}

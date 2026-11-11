@@ -11,6 +11,9 @@ src/pr-reports/sources.schema.json  JSON Schema for the config file
 src/pr-reports/sources.example.json example config (copy to sources.json, which is git-ignored)
 src/pr-reports/test_report_config.py unit tests (python -m unittest, run from src/pr-reports)
 src/backlog-reports/ado_story_report.py   Azure DevOps: time in state and AI usage for done user stories
+src/backlog-reports/story_config.py        story selection config (area paths, created date, tasks required)
+src/backlog-reports/stories.schema.json    JSON Schema for that config
+src/backlog-reports/stories.example.json   example (copy to stories.json, which is git-ignored)
 src/backlog-reports/test_ado_story_report.py unit tests (python -m unittest, run from src/backlog-reports)
 ```
 
@@ -96,5 +99,24 @@ python src/backlog-reports/ado_story_report.py                          # org/pr
 python src/backlog-reports/ado_story_report.py --org my-org --project MyProject --since 2026-01-01
 python src/backlog-reports/ado_story_report.py --prs src/pr-reports/ai-prs.json --out ai-stories.html --json ai-stories.json
 ```
+
+#### Choosing which stories are used (config file)
+
+By default every story of the type that reached `Done` in the period is used. A config file narrows that. Copy `stories.example.json` to `stories.json` (git-ignored, so your area paths stay private) and pass it with `--config`:
+
+```json
+{
+  "$schema": "./stories.schema.json",
+  "areaPaths": { "include": ["MyProject\Team A", "MyProject\Team B*"], "exclude": ["MyProject\Team A\Operations"] },
+  "createdSince": "2025-01-01",
+  "requireTasks": true
+}
+```
+
+- `areaPaths`: `include` / `exclude` lists of area paths. A pattern matches the area and everything below it (like `UNDER` in Azure DevOps). `*` matches within one level, `**` across levels, `?` one character; case-insensitive. `exclude` wins, an empty `include` means every area. Patterns that match no story are reported on stderr.
+- `createdSince`: only stories created on or after this date (also available as `--created-since`, which wins over the config).
+- `requireTasks`: only stories with at least one child work item. Useful when pull requests are linked from tasks, because a story without tasks usually has no PR to find.
+
+The report header lists the active selection. `--since` still controls the done date.
 
 Authentication uses your Azure CLI login (`az login`). A login can span several Entra tenants and only one backs the organization, so the tool tries each tenant until Azure DevOps accepts one (`--tenant` pins it). Alternatively set a personal access token in `ADO_PAT`. State histories are cached in `.cache/`. The report contains story titles and is git-ignored.
